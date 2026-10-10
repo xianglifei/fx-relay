@@ -112,9 +112,9 @@ async function runAgent(adapter, prompt, workdir) {
 }
 
 async function workOnce(agent) {
-  const { tasks } = await api("/tasks?status=queued");
+  const { tasks } = await api("/tasks?status=claimable");
   if (!tasks?.length) return false;
-  const target = tasks[tasks.length - 1]; // oldest queued
+  const target = tasks[0]; // oldest claimable
   const task = await api(`/tasks/${target.id}/claim`, {
     method: "POST",
     body: JSON.stringify({ agent }),

@@ -132,16 +132,21 @@ export default {
       return json(await getTask(env.DB, id), 201);
     }
 
-    // ---- GET /tasks?status=
+    // ---- GET /tasks?status=  ("claimable" = queued | re_forked | failed)
     if (req.method === "GET" && path === "/tasks") {
       const status = url.searchParams.get("status");
-      const rows = status
+      const claimable = status === "claimable";
+      const rows = claimable
         ? await env.DB.prepare(
-            "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC LIMIT 100",
-          ).bind(status).all()
-        : await env.DB.prepare(
-            "SELECT * FROM tasks ORDER BY created_at DESC LIMIT 100",
-          ).all();
+            "SELECT * FROM tasks WHERE status IN ('queued','re_forked','failed') ORDER BY created_at ASC LIMIT 100",
+          ).all()
+        : status
+          ? await env.DB.prepare(
+              "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC LIMIT 100",
+            ).bind(status).all()
+          : await env.DB.prepare(
+              "SELECT * FROM tasks ORDER BY created_at DESC LIMIT 100",
+            ).all();
       return json({ tasks: rows.results });
     }
 
@@ -169,7 +174,7 @@ export default {
       const ts = now();
       const res = await env.DB.prepare(
         `UPDATE tasks SET status = 'assigned', assigned_agent = ?, attempt = attempt + 1, updated_at = ?
-         WHERE id = ? AND status IN ('queued', 're_forked')`,
+         WHERE id = ? AND status IN ('queued', 're_forked', 'failed')`,
       )
         .bind(agent, ts, id)
         .run();

@@ -1,0 +1,9 @@
+{
+  "name": "relay-runner",
+  "version": "0.1.0",
+  "description": "Relay execution plane: drives real coding agents against fork-per-task workspaces",
+  "type": "module",
+  "license": "MIT",
+  "bin": { "relay-runner": "./bin/relay-runner.mjs" },
+  "engines": { "node": ">=20" }
+}

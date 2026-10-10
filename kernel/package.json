@@ -1,0 +1,16 @@
+{
+  "name": "relay-kernel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "db:migrate": "wrangler d1 execute relay-kernel --remote --file schema.sql",
+    "db:migrate:local": "wrangler d1 execute relay-kernel --local --file schema.sql",
+    "types": "wrangler types"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "wrangler": "^4.149.0"
+  }
+}

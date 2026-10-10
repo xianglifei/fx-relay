@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "relay-kernel",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-10",
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "relay" }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "relay-kernel",
+      "database_id": "04f88c55-9b46-4575-8104-0ee55830068e"
+    }
+  ],
+  "queues": {
+    "consumers": [{ "queue": "relay-events", "max_batch_size": 1 }]
+  },
+  "vars": {
+    "RELAY_NAMESPACE": "relay",
+    "RELAY_BASELINE": "demo-app"
+  }
+}

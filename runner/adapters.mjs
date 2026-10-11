@@ -33,10 +33,6 @@ export const adapters = {
     args: (prompt) => ["-p", prompt, "--dangerously-skip-permissions"],
     timeoutMs: 30 * 60 * 1000,
   },
-  dsh: {
-    label: "DeepSeek CLI",
-    cmd: "dsh",
-    args: (prompt) => ["-p", prompt],
-    timeoutMs: 30 * 60 * 1000,
-  },
+  // dsh needs an interactive harness profile — not usable headless yet.
+  // zcode: app-server protocol mapped (see docs/), pending provider-registry fix.
 };

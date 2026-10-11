@@ -135,14 +135,22 @@ async function runAgent(adapter, prompt, workdir) {
 async function workOnce(agent) {
   const { tasks } = await api("/tasks?status=claimable");
   if (!tasks?.length) return false;
-  const target = tasks[0]; // oldest claimable
-  const task = await api(`/tasks/${target.id}/claim`, {
-    method: "POST",
-    body: JSON.stringify({ agent, from_status: target.status }),
-  }).catch(() => null);
-  if (!task) return true; // lost the race, loop again
+  // oldest first; a concurrent runner may win a claim (409) — try the next one
+  for (const target of tasks) {
+    const task = await api(`/tasks/${target.id}/claim`, {
+      method: "POST",
+      body: JSON.stringify({ agent, from_status: target.status }),
+    }).catch(() => null);
+    if (!task) continue;
+    await executeTask(task, target.status, agent);
+    return true;
+  }
+  return true; // all lost to races; caller loops
+}
 
-  console.log(`[runner] claimed ${task.id} (attempt ${task.attempt}, from ${target.status})`);
+async function executeTask(task, fromStatus, agent) {
+  const target = { id: task.id, status: fromStatus };
+  console.log(`[runner] claimed ${task.id} (attempt ${task.attempt}, from ${fromStatus})`);
   console.log(`[runner] spec: ${task.spec}`);
 
   const workdir = await mkdtemp(path.join(os.tmpdir(), `relay-${task.id}-`));

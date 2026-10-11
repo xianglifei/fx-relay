@@ -19,6 +19,8 @@ export interface Env {
   RELAY_BASELINE: string;
 }
 
+import { dashboardHtml } from "./dashboard";
+
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data, null, 2) + "\n", {
     status,
@@ -140,8 +142,31 @@ export default {
     const url = new URL(req.url);
     const path = url.pathname;
 
+    // ---- GET / — dashboard (public shell; data APIs below require the token)
+    if (req.method === "GET" && (path === "/" || path === "/dashboard")) {
+      return new Response(dashboardHtml, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
     if (req.method === "GET" && path === "/healthz") return json({ ok: true, ts: now() });
     if (!(await authed(req, env))) return json({ error: "unauthorized" }, 401);
+
+    // ---- GET /events — global activity feed
+    if (req.method === "GET" && path === "/events") {
+      const { results } = await env.DB.prepare(
+        "SELECT * FROM events ORDER BY seq DESC LIMIT 120",
+      ).all();
+      return json({ events: results });
+    }
+
+    // ---- GET /provenance — who wrote what, and why
+    if (req.method === "GET" && path === "/provenance") {
+      const { results } = await env.DB.prepare(
+        "SELECT * FROM provenance ORDER BY created_at DESC LIMIT 120",
+      ).all();
+      return json({ provenance: results });
+    }
 
     // ---- POST /bootstrap {repo?, description?}
     if (req.method === "POST" && path === "/bootstrap") {
@@ -315,7 +340,7 @@ export default {
       await logEvent(env.DB, id, "task.claimed", { agent, attempt: task.attempt, from: body.from_status ?? null });
       using ws = await env.ARTIFACTS.get(task.workspace_repo as string);
       const tok = await ws.createToken("write", 2700);
-      const wasReviewFailed = body.from_status === "review_failed" || task.status === "assigned";
+      const wasRedo = body.from_status === "review_failed" || body.from_status === "re_forked";
       const review = task.review ? JSON.parse(task.review) : null;
       return json({
         id,
@@ -328,8 +353,10 @@ export default {
         write_token: tok.plaintext,
         token_expires_at: tok.expiresAt,
         // remediation inputs: agent reads these to redo/repair
-        review: wasReviewFailed && review ? { verdict: review.verdict, reason: review.reason, instructions: review.instructions } : null,
-        previous_touch_set: wasReviewFailed ? touchSetOf(task) : null,
+        review: body.from_status === "review_failed" && review
+          ? { verdict: review.verdict, reason: review.reason, instructions: review.instructions }
+          : null,
+        previous_touch_set: wasRedo ? touchSetOf(task) : null,
       });
     }
 

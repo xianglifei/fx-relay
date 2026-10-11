@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   attempt INTEGER NOT NULL DEFAULT 0,
   touch_set TEXT,                  -- JSON array of changed file paths
   head_sha TEXT,
+  review TEXT,                     -- JSON: {verdict, reason, instructions, model}
+  merged_sha TEXT,
+  merged_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

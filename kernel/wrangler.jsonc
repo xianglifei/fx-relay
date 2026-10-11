@@ -4,6 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-10",
   "artifacts": [{ "binding": "ARTIFACTS", "namespace": "relay" }],
+  "ai": { "binding": "AI" },
   "d1_databases": [
     {
       "binding": "DB",

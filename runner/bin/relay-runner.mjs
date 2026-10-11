@@ -149,7 +149,6 @@ async function workOnce(agent) {
 }
 
 async function executeTask(task, fromStatus, agent) {
-  const target = { id: task.id, status: fromStatus };
   console.log(`[runner] claimed ${task.id} (attempt ${task.attempt}, from ${fromStatus})`);
   console.log(`[runner] spec: ${task.spec}`);
 

@@ -20,6 +20,14 @@ export interface Env {
 }
 
 import { dashboardHtml } from "./dashboard";
+import {
+  workspaceName,
+  parseWorkspace,
+  touchSetOf,
+  decideMerge,
+  isStaleMerging,
+  parseReviewOutput,
+} from "./logic";
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data, null, 2) + "\n", {
@@ -27,7 +35,13 @@ const json = (data: unknown, status = 200) =>
     headers: { "content-type": "application/json; charset=utf-8" },
   });
 const now = () => new Date().toISOString();
+const safeParse = (s: string): any => {
+  try { return JSON.parse(s); } catch { return null; }
+};
 const newTaskId = () => "tsk_" + crypto.randomUUID().replace(/-/g, "").slice(0, 10);
+
+/** 'merging' grants older than this are recovered back to awaiting_merge. */
+const MERGE_GRANT_TIMEOUT_MS = 10 * 60 * 1000;
 
 async function logEvent(db: D1Database, taskId: string | null, type: string, payload: unknown) {
   await db
@@ -38,19 +52,6 @@ async function logEvent(db: D1Database, taskId: string | null, type: string, pay
 
 async function getTask(db: D1Database, id: string) {
   return db.prepare("SELECT * FROM tasks WHERE id = ?").bind(id).first<Record<string, any>>();
-}
-
-const touchSetOf = (task: Record<string, any>): string[] => {
-  try { return JSON.parse(task.touch_set ?? "[]"); } catch { return []; }
-};
-const intersects = (a: string[], b: string[]) => a.some((f) => b.includes(f));
-
-function workspaceName(taskId: string, attempt: number) {
-  return `task-${taskId.replace(/^tsk_/, "")}-a${attempt}`;
-}
-function parseWorkspace(repo: string) {
-  const m = /^task-([a-z0-9]+)-a(\d+)$/.exec(repo);
-  return m ? { taskId: "tsk_" + m[1], attempt: Number(m[2]) } : null;
 }
 
 async function authed(req: Request, env: Env): Promise<boolean> {
@@ -96,11 +97,19 @@ async function reforkTask(env: Env, task: Record<string, any>, why: string) {
 
 /** Review agent: Workers AI, structured verdict. */
 export async function reviewTask(env: Env, task: Record<string, any>, diff: string): Promise<any> {
+  // spec is API-supplied and flows into the model prompt: cap it (context + prompt-injection surface)
+  const attempt = Number(task.attempt) || 1;
+  const prevReview = task.review ? safeParse(task.review) : null;
+  const remediation =
+    attempt > 1
+      ? `\n\n## 整改背景\n这是第 ${attempt} 次尝试。此前一轮被审查打回,原因:"${String(prevReview?.reason ?? "未通过").slice(0, 300)}"。当前 diff 可能包含对上一轮问题的修复(例如恢复被误改的文件),应结合任务规格评估其最终效果,不要仅因"改动较多"而拒绝。`
+      : "";
   const prompt = [
     "你是 Relay 平台的代码审查 agent。对照任务规格审查 diff,输出严格的 JSON(不要 markdown 代码块,不要解释):",
     '{"verdict":"approve"|"reject","reason":"<一句话>","instructions":"<reject 时给编码 agent 的可执行整改指令,approve 时留空>"}',
     "",
-    `## 任务规格\n${task.spec}`,
+    `## 任务规格\n${String(task.spec).slice(0, 4000)}`,
+    remediation,
     "",
     `## Diff\n${diff.slice(0, 50000)}`,
   ].join("\n");
@@ -109,29 +118,16 @@ export async function reviewTask(env: Env, task: Record<string, any>, diff: stri
       messages: [{ role: "user", content: prompt }],
       max_tokens: 600,
     });
-    // Workers AI return shapes vary by model/route: string | {response} | content-block arrays.
-    const flatten = (v: any): string => {
-      if (v == null) return "";
-      if (typeof v === "string") return v;
-      if (Array.isArray(v)) return v.map((b) => (typeof b === "string" ? b : b?.text ?? b?.response ?? "")).join("");
-      if (typeof v === "object") {
-        if (Array.isArray(v.choices)) return flatten(v.choices[0]?.message?.content ?? "");
-        return flatten(v.response ?? v.result ?? v.text ?? "");
-      }
-      return String(v);
-    };
-    const text = flatten(out) || JSON.stringify(out ?? "");
-    const m = /\{[\s\S]*\}/.exec(text);
-    const parsed = m ? JSON.parse(m[0]) : null;
-    if (parsed?.verdict) {
+    const parsed = parseReviewOutput(out);
+    if (parsed.ok) {
       return {
-        verdict: parsed.verdict === "approve" ? "approve" : "reject",
-        reason: String(parsed.reason ?? "").slice(0, 1000),
-        instructions: String(parsed.instructions ?? "").slice(0, 1000),
+        verdict: parsed.verdict,
+        reason: parsed.reason,
+        instructions: parsed.instructions,
         model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
       };
     }
-    return { verdict: "approve", reason: "review parse failed, auto-approved", instructions: "", model: "fallback", raw: text.slice(0, 400) };
+    return { verdict: "approve", reason: "review parse failed, auto-approved", instructions: "", model: "fallback", raw: parsed.raw };
   } catch (e) {
     return { verdict: "approve", reason: `review agent error, auto-approved: ${String(e).slice(0, 200)}`, instructions: "", model: "fallback" };
   }
@@ -240,6 +236,15 @@ export default {
 
     // ---- POST /schedule — the merge scheduler. One grant per call (serialized mainline).
     if (req.method === "POST" && path === "/schedule") {
+      // recover stale 'merging' grants (merger crashed mid-execution)
+      const staleCut = new Date(Date.now() - MERGE_GRANT_TIMEOUT_MS).toISOString();
+      const rec = await env.DB.prepare(
+        "UPDATE tasks SET status='awaiting_merge', updated_at=? WHERE status='merging' AND updated_at < ?",
+      ).bind(now(), staleCut).run();
+      if (rec.meta.changes) {
+        await logEvent(env.DB, null, "merge.recovered", { count: rec.meta.changes });
+      }
+
       const { results: awaiting } = await env.DB.prepare(
         "SELECT * FROM tasks WHERE status = 'awaiting_merge' ORDER BY created_at ASC LIMIT 1",
       ).all<Record<string, any>>();
@@ -249,39 +254,21 @@ export default {
       const grants: any[] = [];
       const reforked: any[] = [];
 
-      // touch-sets already on mainline — only tasks merged AFTER this workspace
-      // was forked can conflict with it (temporal rule, converges by construction)
+      // touch-sets already on mainline
       const { results: mergedTasks } = await env.DB.prepare(
         "SELECT id, touch_set, merged_sha, merged_at FROM tasks WHERE status='merged' AND merged_at IS NOT NULL ORDER BY merged_at ASC LIMIT 200",
       ).all<Record<string, any>>();
 
-      for (const task of awaiting) {
-        const mine = touchSetOf(task);
-        const mergedSince = mergedTasks.filter((mt) => mt.merged_at > task.forked_at);
-        const overlap = mergedSince
-          .filter((mt) => intersects(mine, touchSetOf(mt)))
-          .map((mt) => mt.id);
-
-        const ffable = !head || !task.fork_base_sha || head === task.fork_base_sha;
-        if (overlap.length > 0) {
-          // conflict course: re-fork on current baseline, agent redoes.
-          // Runs FIRST — touch-set overlap with merged work is a hard signal,
-          // even when the baseline head snapshot is unavailable.
-          await reforkTask(env, task, `touch-set overlaps merged tasks: ${overlap.join(",")}`);
-          reforked.push({ task_id: task.id, overlaps: overlap });
-        } else if (ffable) {
-          // linear mainline untouched since fork → plain fast-forward
-          await env.DB.prepare("UPDATE tasks SET status='merging', updated_at=? WHERE id=?")
-            .bind(now(), task.id).run();
-          await logEvent(env.DB, task.id, "merge.granted", { mode: "fast_forward" });
-          grants.push({ task_id: task.id, mode: "fast_forward" });
-        } else {
-          // baseline moved but files disjoint → runner replays commits
-          await env.DB.prepare("UPDATE tasks SET status='merging', updated_at=? WHERE id=?")
-            .bind(now(), task.id).run();
-          await logEvent(env.DB, task.id, "merge.granted", { mode: "rebase" });
-          grants.push({ task_id: task.id, mode: "rebase" });
-        }
+      const task = awaiting[0];
+      const decision = decideMerge(task, mergedTasks, head);
+      if (decision.action === "refork") {
+        await reforkTask(env, task, `touch-set overlaps merged tasks: ${decision.overlaps.join(",")}`);
+        reforked.push({ task_id: task.id, overlaps: decision.overlaps });
+      } else {
+        await env.DB.prepare("UPDATE tasks SET status='merging', updated_at=? WHERE id=?")
+          .bind(now(), task.id).run();
+        await logEvent(env.DB, task.id, "merge.granted", { mode: decision.action });
+        grants.push({ task_id: task.id, mode: decision.action });
       }
       return json({ grants, reforked, baseline_head: head });
     }
@@ -294,8 +281,8 @@ export default {
       if (!task) return json({ grant: null });
       using wsRepo = await env.ARTIFACTS.get(task.workspace_repo as string);
       using baseRepo = await env.ARTIFACTS.get(task.baseline_repo as string);
-      const wsTok = await wsRepo.createToken("read", 1800);
-      const baseTok = await baseRepo.createToken("write", 1800);
+      const wsTok = await wsRepo.createToken("read", 300);
+      const baseTok = await baseRepo.createToken("write", 300);
       return json({
         grant: {
           task_id: task.id,
@@ -331,16 +318,19 @@ export default {
     if (req.method === "POST" && action === "claim") {
       const agent = (body.agent as string)?.trim();
       if (!agent) return json({ error: "agent is required" }, 400);
+      // server-side pre-claim status decides remediation context — never trust the client
+      const existing = await getTask(env.DB, id);
+      if (!existing) return json({ error: "task not found" }, 404);
       const res = await env.DB.prepare(
         `UPDATE tasks SET status='assigned', assigned_agent=?, attempt=attempt+1, updated_at=?
          WHERE id=? AND status IN ('queued','re_forked','failed','review_failed')`,
       ).bind(agent, now(), id).run();
       if (!res.meta.changes) return json({ error: "task not claimable" }, 409);
       const task = await getTask(env.DB, id);
-      await logEvent(env.DB, id, "task.claimed", { agent, attempt: task.attempt, from: body.from_status ?? null });
+      const fromStatus = existing.status as string;
+      await logEvent(env.DB, id, "task.claimed", { agent, attempt: task.attempt, from: fromStatus });
       using ws = await env.ARTIFACTS.get(task.workspace_repo as string);
       const tok = await ws.createToken("write", 2700);
-      const wasRedo = body.from_status === "review_failed" || body.from_status === "re_forked";
       const review = task.review ? JSON.parse(task.review) : null;
       return json({
         id,
@@ -353,10 +343,13 @@ export default {
         write_token: tok.plaintext,
         token_expires_at: tok.expiresAt,
         // remediation inputs: agent reads these to redo/repair
-        review: body.from_status === "review_failed" && review
+        review: fromStatus === "review_failed" && review
           ? { verdict: review.verdict, reason: review.reason, instructions: review.instructions }
           : null,
-        previous_touch_set: wasRedo ? touchSetOf(task) : null,
+        previous_touch_set:
+          fromStatus === "review_failed" || fromStatus === "re_forked"
+            ? touchSetOf(existing)
+            : null,
       });
     }
 
@@ -365,6 +358,14 @@ export default {
       const task = await getTask(env.DB, id);
       if (!task) return json({ error: "task not found" }, 404);
       const result = body.result as string;
+      // State guard: reports only transition valid predecessors, never rewind history.
+      const okFrom = result === "conflict" ? ["merging"] : ["assigned", "pushed"];
+      if (!okFrom.includes(task.status as string)) {
+        return json(
+          { error: `report '${result}' not accepted for task in status '${task.status}'` },
+          409,
+        );
+      }
       const ts = now();
       if (result === "pushed") {
         await env.DB.prepare(

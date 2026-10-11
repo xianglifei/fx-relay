@@ -134,9 +134,10 @@ function renderEvents(evs) {
   return evs.map(e => {
     let d = '';
     try { const p = JSON.parse(e.payload || '{}');
-      d = p.spec ? esc(p.spec.slice(0, 60)) : [p.agent, p.after && short(p.after), p.mode, p.why && esc(String(p.why).slice(0, 60)), p.detail && esc(String(p.detail).slice(0, 60))].filter(Boolean).join(' · ');
+      d = p.spec ? esc(p.spec.slice(0, 60)) : [p.agent, p.after, p.mode, p.why, p.detail]
+        .map(v => v ? esc(String(v).slice(0, 60)) : '').filter(Boolean).join(' · ');
     } catch {}
-    return \`<div class="ev"><span class="t">\${fmt(e.created_at)}</span><span class="k" style="color:\${evColor(e.type)}">\${e.type}</span><span class="d">\${e.task_id ? e.task_id + ' ' : ''}\${d}</span></div>\`;
+    return \`<div class="ev"><span class="t">\${fmt(e.created_at)}</span><span class="k" style="color:\${evColor(e.type)}">\${esc(e.type)}</span><span class="d">\${e.task_id ? esc(e.task_id) + ' ' : ''}\${d}</span></div>\`;
   }).join('');
 }
 

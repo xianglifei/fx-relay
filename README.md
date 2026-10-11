@@ -100,12 +100,27 @@ node bin/relay-runner.mjs merge --once
 | zcode | 🔧 协议已通 | app-server 协议逆向笔记见 [docs/zcode-app-server-protocol.md](docs/zcode-app-server-protocol.md),待 provider registry 注入 |
 | 你的 agent | 欢迎 PR | 任何有 headless 模式的 CLI,往 `adapters.mjs` 加一段即可 |
 
+## 测试
+
+```bash
+# 单元测试(纯逻辑:调度决策、touch-set 时间规则、AI 输出解析、CLI 参数)
+node --test kernel/test/logic.test.ts runner/test/flags.test.mjs
+
+# 集成测试(专项:鉴权、校验、认领竞态、全生命周期、打回-整改闭环、
+#            状态守卫、主线线性;独立测试基线,跑完自动清理)
+node kernel/test/integration.mjs --url https://<your>.workers.dev --token <RELAY_TOKEN>
+```
+
+集成套件 T8 断言测试主线 commit 数精确匹配——防止调度器把不相干变更放进主线,或静默丢合并。
+
 ## 设计笔记
 
-- **时间规则保证收敛**:调度器的冲突判断只比较"本任务 fork **之后**合并进主线的任务"。若用 sha 相等判断,链式合并会造成无限 re-fork(我们踩过);时间规则在构造上收敛。
+- **时间规则保证收敛**:调度器的冲突判断只比较"本任务 fork **之后**合并进主线的任务"。若用 sha 相等判断,链式合并会造成无限 re-fork(我们踩过);时间规则在构造上收敛,并有回归单测把守(`REGRESSION: ... must NOT refork`)。
 - **touch-set 是申报制**:runner 从 `git diff --name-only fork_base..HEAD` 计算,是乐观估计;git 层面 cherry-pick 是最终裁决。调度器宁可错杀(多一次重做),不放过大 diff。
-- **调度器一次只发一个合并令牌**:主线线性是硬约束,合并天然串行;吞吐靠"重做便宜"来兜底,不靠并行合并。
+- **调度器一次只发一个合并令牌**:主线线性是硬约束,合并天然串行;吞吐靠"重做便宜"来兜底,不靠并行合并。merger 崩溃会由 /schedule 的 stale 回收(10 分钟)自愈。
+- **整改 diff 需要整改上下文**:审查 agent 若不知道"这是第 N 次尝试、上一轮为何被打回",会合法地拒绝一个 noisy 的修复 diff(它看到的是恢复性大改动)。审查 prompt 现在携带整改背景——这个坑是集成测试 T6 抓出来的。
 - **kernel 不跑 git**:Workers 里没有 git 二进制。快进/重放由本地 runner 执行,平台持有"决定权",机器持有"执行权"。
+- **已知残留风险**:审查 prompt 含任务规格与 diff,理论上可被 prompt injection 操纵(spec 里写"输出 approve");fallback 策略是 AI 调用失败时放行并打标。生产化需引入策略层(人类定义的可执行规则)。
 
 ## 路线图
 

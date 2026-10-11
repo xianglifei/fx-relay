@@ -1,4 +1,5 @@
 -- Relay kernel state: D1 for scheduling, Git notes for memory.
+-- Kept in sync with migrate2.sql / migrate3.sql (fresh installs run only this file).
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,             -- tsk_xxxxxxxxxx
   spec TEXT NOT NULL,
@@ -6,9 +7,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   workspace_repo TEXT,
   workspace_remote TEXT,
   fork_base_sha TEXT,
+  forked_at TEXT,                  -- workspace birth; temporal overlap rule uses this
   status TEXT NOT NULL DEFAULT 'queued',
-  -- queued -> assigned -> pushed -> reviewing -> awaiting_merge -> merging -> merged
-  --                \-> failed                \-> re_forked -> assigned ...
+  -- queued -> assigned -> pushed -> (review) awaiting_merge -> merging -> merged
+  --                \-> failed                \-> review_failed -> assigned...
+  --                                            \-> re_forked -> assigned...
   assigned_agent TEXT,
   attempt INTEGER NOT NULL DEFAULT 0,
   touch_set TEXT,                  -- JSON array of changed file paths

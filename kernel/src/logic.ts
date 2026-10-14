@@ -17,6 +17,7 @@ export interface MergedTaskLike {
   id?: string;
   touch_set?: string | null;
   merged_at?: string | null;
+  [k: string]: unknown;
 }
 
 export function workspaceName(taskId: string, attempt: number): string {
@@ -227,11 +228,44 @@ export function applyPolicy(
   const maxDiff = p.max_diff_bytes ?? 200000;
   if (diffBytes > maxDiff)
     violations.push({ rule: "max_diff_bytes", detail: `diff ${diffBytes} 字节,超过上限 ${maxDiff}` });
-  const instructions = violations.length
+  // DoS guard: a hostile runner can report a huge touch_set; instructions stay bounded
+  const shown = violations.slice(0, 50);
+  const rest = violations.length - shown.length;
+  const instructions = shown.length
     ? "确定性策略拦截(非 AI 审查),请收窄改动后重做:\n" +
-      violations.map((v) => `- [${v.rule}] ${v.detail}`).join("\n")
+      shown.map((v) => `- [${v.rule}] ${v.detail}`).join("\n") +
+      (rest > 0 ? `\n(另有 ${rest} 项违规未列出)` : "")
     : "";
   return { ok: violations.length === 0, violations, instructions };
+}
+
+// ---------- submit-token abuse guard ----------
+
+export const MAX_OPEN_TASKS_PER_BASELINE = 50;
+/** Per-minute creation cap for submit tokens. The worker feeds the sum of the
+ *  current and previous minute buckets (sliding-window approximation), so a
+ *  burst straddling a minute boundary cannot split itself under the cap. */
+export const MAX_TASKS_PER_MINUTE = 12;
+
+/**
+ * Task creation gate for submit-token callers (admin bypasses). Each task
+ * forks an Artifacts repo, so unbounded creation burns storage: cap open
+ * tasks per baseline and creations per minute (the caller feeds an atomic
+ * D1 counter, so concurrent requests cannot read a stale count).
+ */
+export function allowTaskCreation(
+  openTasks: number,
+  recentTasks: number,
+  isAdmin: boolean,
+  caps: { open?: number; perMinute?: number } = {},
+): { ok: boolean; reason?: string } {
+  if (isAdmin) return { ok: true };
+  const open = caps.open ?? MAX_OPEN_TASKS_PER_BASELINE;
+  const perMin = caps.perMinute ?? MAX_TASKS_PER_MINUTE;
+  if (openTasks >= open)
+    return { ok: false, reason: `该基线未完结任务已达上限(${open}),待任务合并/失败后再提交` };
+  if (recentTasks >= perMin) return { ok: false, reason: `创建频率超限(每分钟 ${perMin} 个)` };
+  return { ok: true };
 }
 
 export interface CheckResult {

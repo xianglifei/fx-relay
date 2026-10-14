@@ -88,12 +88,6 @@ let URL_BASE = location.origin;
 let tab = 'tasks';
 let timer = null;
 
-// ?token=... — for automation/demo screenshots; persists like manual entry
-(() => {
-  const q = new URLSearchParams(location.search).get('token');
-  if (q) { TOKEN = q; localStorage.setItem('relay_token', q); history.replaceState(null, '', location.pathname); }
-})();
-
 function gate() {
   document.getElementById('app').innerHTML = \`
   <div id="gate">
@@ -122,7 +116,7 @@ function taskCard(t) {
   const review = t.review ? JSON.parse(t.review) : null;
   const rv = review ? '<span class="' + (review.verdict === 'approve' ? 'verdict-approve' : 'verdict-reject') + '">⚖ ' + esc(review.model === 'human' ? 'human' : review.verdict) + (review.reason ? ' · ' + esc(review.reason) : '') + '</span>' : '';
   const gate = t.status === 'needs_human'
-    ? '<span class="hg"><button onclick="humanReview(\\'' + t.id + '\\',true)">✓ 放行</button><button onclick="humanReview(\\'' + t.id + '\\',false)">✗ 打回</button></span>' : '';
+    ? '<span class="hg"><button onclick="humanReview(\\'' + esc(t.id) + '\\',true)">✓ 放行</button><button onclick="humanReview(\\'' + esc(t.id) + '\\',false)">✗ 打回</button></span>' : '';
   return \`<div class="task">
     <div class="row1"><span class="chip" style="background:\${color}22;color:\${color}">\${label}</span>
       <span class="id">\${t.id}</span>\${t.attempt > 0 ? '<span class="id">attempt ' + t.attempt + '</span>' : ''}\${gate}</div>

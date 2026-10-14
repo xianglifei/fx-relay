@@ -121,6 +121,7 @@ review_failed → claim(带指令)整改循环,不新增学习成本。
 | `RELAY_SUBMIT_TOKEN`(可选) | 提交任务 + 只读看板/列表;调度、认领、人审、合并一律 401 | 团队成员 |
 
 不设 `RELAY_SUBMIT_TOKEN` 时行为与单令牌完全一致。fork 的 45min 仓库级 write token 机制不变。
+submit 令牌自带滥用护栏:每基线未完结任务 ≤ 50,创建频率 ≤ 12/分钟(两分钟桶滑窗,D1 原子计数,并行突发也拦得住);admin 令牌不受限。
 
 ## 常驻 runner(无人值守)
 

@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: install kernel deps
+        working-directory: kernel
+        run: npm ci
+      - name: generate worker types
+        working-directory: kernel
+        run: npx wrangler types
+      - name: typecheck (strict, zero errors)
+        working-directory: kernel
+        run: npx tsc --noEmit
+      - name: unit tests (pure logic)
+        run: node --test kernel/test/logic.test.ts runner/test/flags.test.mjs

@@ -4,7 +4,9 @@
  * Runs against a kernel URL + token (default: production). Uses a dedicated
  * test baseline + "[test]" task specs, then cleans up repos and D1 rows.
  *
- * Usage: node test/integration.mjs [--url URL] [--token TOK]
+ * Usage: node test/integration.mjs [--url URL] [--token TOK] [--submit-token TOK]
+ * NOTE: stop any resident merge runner first (launchctl unload com.relay.merge
+ *       / systemctl stop relay-merge) — the daemon races this suite for grants.
  */
 import { spawn, execSync } from "node:child_process";
 import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
@@ -242,8 +244,11 @@ await t("T6 reject loop: destructive diff → reject → re-claim carries instru
   expect((await taskStatus(rejectTaskId)).status === "merged", "not merged");
 });
 
-await t("T7 race-task cleanup path: failed report accepted from assigned", async () => {
-  // raceTaskId is 'assigned' from T3 — a failed report is a valid transition
+await t("T7 race-task cleanup: attach guard sees open tasks; failed report accepted from assigned", async () => {
+  // raceTaskId is 'assigned' from T3 — bootstrap must report it (attach guard data)
+  const boot = await api("/bootstrap", { method: "POST", body: JSON.stringify({ repo: BASELINE }) });
+  expect((boot.body.open_tasks ?? 0) >= 1, `open_tasks should count the assigned task, got ${boot.body.open_tasks}`);
+  // a failed report is a valid transition from assigned
   const r = await api(`/tasks/${raceTaskId}/report`, { method: "POST", body: JSON.stringify({ result: "failed", detail: "itest cleanup" }) });
   expect(r.status === 200 && r.body.status === "failed", `got ${r.status} ${JSON.stringify(r.body).slice(0, 120)}`);
 });
@@ -331,6 +336,28 @@ await t("T11 token split: submit token can read+create but cannot schedule/claim
   // admin token still schedules fine
   const admin = await api("/schedule", { method: "POST" });
   expect(admin.status === 200, `admin schedule broken: ${admin.status}`);
+});
+
+await t("T12 rate limit: submit-token burst gets 429 (atomic two-bucket window)", async () => {
+  if (!submit_token) { warned++; console.log("      ⚠ no submit token provided (--submit-token) — skipped"); return; }
+  const h = { authorization: `Bearer ${submit_token}`, "content-type": "application/json" };
+  // Sequential: creates are ~5s each (forks are heavy), so 25 span >2 minutes —
+  // only the two-bucket sliding window (current+previous minute, cap 12) makes
+  // this deterministic; a plain 60s rolling window drains as fast as it fills.
+  let created = 0;
+  let got429 = false;
+  for (let i = 0; i < 25 && !got429; i++) {
+    const r = await fetch(url + "/tasks", { method: "POST", headers: h, body: JSON.stringify({ spec: `[test] ratelimit burst ${i}`, baseline: BASELINE }) });
+    if (r.status === 201) { created++; testTaskIds.add((await r.json()).id); }
+    else if (r.status === 429) { got429 = true; }
+    else throw new Error(`unexpected ${r.status} on burst create ${i}`);
+  }
+  expect(got429, `no 429 within 25 sequential creates (created ${created}) — limiter not enforced`);
+  console.log(`      throttled after ${created} creations`);
+  // admin is never throttled (bypass)
+  const admin = await api("/tasks", { method: "POST", body: JSON.stringify({ spec: "[test] admin bypasses limiter", baseline: BASELINE }) });
+  expect(admin.body.id, `admin create throttled unexpectedly: ${admin.status} ${JSON.stringify(admin.body).slice(0, 120)}`);
+  testTaskIds.add(admin.body.id);
 });
 
 await t("T8 mainline linear: test baseline log contains all merged task commits", async () => {

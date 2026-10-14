@@ -14,7 +14,7 @@
  * The runner owns commit, notes, push — the agent only edits files.
  */
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, chmod } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -375,13 +375,29 @@ async function mergeOnce() {
   }
 }
 
-async function seedBaseline(dir, repoName) {
+/**
+ * Force-pushing a baseline that still has open tasks invalidates their
+ * scheduling assumptions (fork_base / temporal rule) — refuse unless forced.
+ */
+function guardOpenTasks(boot, force) {
+  const open = boot.open_tasks ?? 0;
+  if (!force && open > 0) {
+    throw new Error(
+      `基线 ${boot.name} 有 ${open} 个未完结任务,force-push 会作废它们的调度假设。` +
+        `等它们完结,或确认放弃后加 --force 重试`,
+    );
+  }
+  if (open > 0) console.log(`[attach] ⚠ --force:将重写有 ${open} 个在途任务的基线`);
+}
+
+async function seedBaseline(dir, repoName, force) {
   const abs = path.resolve(process.cwd(), dir);
   if (!existsSync(abs)) throw new Error(`baseline dir not found: ${abs}`);
   const boot = await api("/bootstrap", {
     method: "POST",
     body: JSON.stringify({ repo: repoName, description: "Relay demo baseline" }),
   });
+  guardOpenTasks(boot, force);
   console.log(`[seed] repo ${boot.name} -> ${boot.remote}`);
 
   const tmp = await mkdtemp(path.join(os.tmpdir(), "relay-seed-"));
@@ -404,7 +420,7 @@ async function seedBaseline(dir, repoName) {
  * Attach an existing git repository: bootstrap the Artifacts repo and push the
  * committed history of the current branch — the source working tree is never touched.
  */
-async function attachExisting(dir, repoName) {
+async function attachExisting(dir, repoName, force) {
   if (!repoName) throw new Error("usage: relay-runner attach --dir /path/to/repo --repo NAME");
   const abs = path.resolve(process.cwd(), dir || ".");
   if (!existsSync(path.join(abs, ".git"))) {
@@ -419,6 +435,7 @@ async function attachExisting(dir, repoName) {
     method: "POST",
     body: JSON.stringify({ repo: repoName, description: `Relay baseline ${repoName} (attached)` }),
   });
+  guardOpenTasks(boot, force);
   console.log(`[attach] repo ${boot.name} -> ${boot.remote}`);
   const push = await gitAuth(abs, boot.token, "push", "-f", boot.remote, `${branch}:main`);
   if (push.code !== 0) throw new Error(`attach push failed: ${push.out}`);
@@ -469,15 +486,16 @@ async function main() {
     const [url, token] = pos;
     if (!url || !token) throw new Error("usage: relay-runner config <url> <token>");
     await writeFile(LOCAL_CFG, JSON.stringify({ url, token }, null, 2) + "\n");
-    console.log(`[config] wrote ${LOCAL_CFG}`);
+    await chmod(LOCAL_CFG, 0o600); // holds live tokens
+    console.log(`[config] wrote ${LOCAL_CFG} (mode 600)`);
     return;
   }
   if (cmd === "seed") {
-    await seedBaseline(flags.dir || "../baseline-template", flags.repo || "demo-app");
+    await seedBaseline(flags.dir || "../baseline-template", flags.repo || "demo-app", !!flags.force);
     return;
   }
   if (cmd === "attach") {
-    await attachExisting(flags.dir || ".", flags.repo);
+    await attachExisting(flags.dir || ".", flags.repo, !!flags.force);
     return;
   }
   if (cmd === "task") {

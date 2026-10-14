@@ -13,6 +13,7 @@ import {
   normalizePolicy,
   applyPolicy,
   evalChecks,
+  allowTaskCreation,
   DEFAULT_DENY,
 } from "../src/logic.ts";
 
@@ -236,6 +237,15 @@ test("applyPolicy: extra user deny extends the default", () => {
   assert.equal(r.violations[0].rule, "deny");
 });
 
+test("applyPolicy: instructions bounded on mass violations (DoS guard)", () => {
+  const files = Array.from({ length: 80 }, (_, i) => `pem${i}.pem`);
+  const r = applyPolicy(null, files, 100);
+  assert.equal(r.ok, false);
+  const lines = r.instructions.split("\n");
+  assert.equal(lines.filter((l) => l.startsWith("- [")).length, 50, "at most 50 listed");
+  assert.match(r.instructions, /另有 30 项/);
+});
+
 // ---------- evalChecks ----------
 
 test("evalChecks: failing test exit → not ok, instructions carry the tail", () => {
@@ -250,4 +260,26 @@ test("evalChecks: passing exits ok; absent checks not judged; exit 0 lint ok", (
   assert.equal(evalChecks(null).ok, true);
   assert.equal(evalChecks({ tests: { cmd: "npm test", tail: "no exit recorded" } }).ok, true);
   assert.deepEqual(evalChecks({ tests: null, lint: { exit: 3, tail: "eslint error" } }).failed, ["lint"]);
+});
+
+// ---------- allowTaskCreation (submit-token abuse guard) ----------
+
+test("allowTaskCreation: admin bypasses everything", () => {
+  assert.equal(allowTaskCreation(9999, 9999, true).ok, true);
+});
+
+test("allowTaskCreation: open-task cap and per-minute cap, in that order", () => {
+  assert.equal(allowTaskCreation(49, 11, false).ok, true);
+  const open = allowTaskCreation(50, 0, false);
+  assert.equal(open.ok, false);
+  assert.match(open.reason ?? "", /上限/);
+  const rate = allowTaskCreation(0, 20, false);
+  assert.equal(rate.ok, false);
+  assert.match(rate.reason ?? "", /频率/);
+});
+
+test("allowTaskCreation: caps overridable", () => {
+  assert.equal(allowTaskCreation(3, 0, false, { open: 3 }).ok, false);
+  assert.equal(allowTaskCreation(0, 5, false, { perMinute: 5 }).ok, false);
+  assert.equal(allowTaskCreation(3, 5, false, { open: 10, perMinute: 10 }).ok, true);
 });

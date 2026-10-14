@@ -46,5 +46,13 @@ CREATE TABLE IF NOT EXISTS provenance (
   PRIMARY KEY (repo, commit_sha)
 );
 
+-- submit-token creation throttle: atomic per-(minute, baseline) counter
+CREATE TABLE IF NOT EXISTS rate_counters (
+  minute INTEGER NOT NULL,         -- epoch minute
+  baseline TEXT NOT NULL,
+  n INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (minute, baseline)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);

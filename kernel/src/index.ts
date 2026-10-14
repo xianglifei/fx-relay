@@ -33,6 +33,7 @@ import {
   applyPolicy,
   evalChecks,
   normalizePolicy,
+  allowTaskCreation,
 } from "./logic";
 
 const json = (data: unknown, status = 200) =>
@@ -48,6 +49,11 @@ const newTaskId = () => "tsk_" + crypto.randomUUID().replace(/-/g, "").slice(0, 
 
 /** 'merging' grants older than this are recovered back to awaiting_merge. */
 const MERGE_GRANT_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * 'assigned' tasks older than this are re-queued. The claim write token lives
+ * 45min, so by 60min the runner provably cannot push anymore — recovery is safe.
+ */
+const ASSIGNED_TIMEOUT_MS = 60 * 60 * 1000;
 
 async function logEvent(db: D1Database, taskId: string | null, type: string, payload: unknown) {
   await db
@@ -77,7 +83,7 @@ async function baselineHead(env: Env, baseline: string): Promise<string | null> 
   try {
     using repo = await env.ARTIFACTS.get(baseline);
     const head = await repo.log({ limit: 1 });
-    return head[0]?.id ?? null;
+    return head[0]?.hash ?? null;
   } catch { return null; }
 }
 
@@ -99,7 +105,7 @@ async function reforkTask(env: Env, task: Record<string, any>, why: string) {
     `UPDATE tasks SET status='re_forked', workspace_repo=?, workspace_remote=?, fork_base_sha=?,
        touch_set=NULL, head_sha=NULL, attempt=?, forked_at=?, updated_at=? WHERE id=?`,
   )
-    .bind(ws.name, ws.remote, head[0]?.id ?? null, attempt, now(), now(), id)
+    .bind(ws.name, ws.remote, head[0]?.hash ?? null, attempt, now(), now(), id)
     .run();
   await logEvent(env.DB, id, "task.reforked", {
     why,
@@ -194,9 +200,9 @@ export default {
       return json({ provenance: results });
     }
 
-    // ---- POST /bootstrap {repo?, description?}
+    // ---- POST /bootstrap {repo?, description?} — also reports open tasks (attach guard)
     if (req.method === "POST" && path === "/bootstrap") {
-      const body = await req.json().catch(() => ({}));
+      const body = (await req.json().catch(() => ({}))) as Record<string, any>;
       const name = (body.repo as string) || env.RELAY_BASELINE;
       let remote: string;
       try {
@@ -212,15 +218,42 @@ export default {
       }
       using repo = await env.ARTIFACTS.get(name);
       const tok = await repo.createToken("write", 3600);
-      return json({ name, remote, token: tok.plaintext, expiresAt: tok.expiresAt });
+      const { results } = await env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM tasks WHERE baseline_repo=? AND status NOT IN ('merged','failed')",
+      ).bind(name).all<{ n: number }>();
+      return json({ name, remote, token: tok.plaintext, expiresAt: tok.expiresAt, open_tasks: results[0]?.n ?? 0 });
     }
 
-    // ---- POST /tasks {spec, baseline?}
+    // ---- POST /tasks {spec, baseline?, policy?, needs_human_review?}
     if (req.method === "POST" && path === "/tasks") {
-      const body = await req.json().catch(() => ({}));
+      const body = (await req.json().catch(() => ({}))) as Record<string, any>;
       const spec = (body.spec as string)?.trim();
       if (!spec) return json({ error: "spec is required" }, 400);
       const baseline = (body.baseline as string) || env.RELAY_BASELINE;
+
+      // submit-token callers are rate-limited: every task forks an Artifacts repo.
+      // Atomic upsert into a per-(minute, baseline) counter + the previous
+      // bucket's total: a two-bucket sliding window, so a burst straddling a
+      // minute boundary cannot split itself under the cap, and SQLite-side
+      // serialization means concurrent requests cannot read a stale count.
+      const openRow = await env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM tasks WHERE baseline_repo=? AND status NOT IN ('merged','failed')",
+      ).bind(baseline).first<{ n: number }>();
+      const minute = Math.floor(Date.now() / 60_000);
+      const prevRow = await env.DB.prepare(
+        "SELECT n FROM rate_counters WHERE minute = ? AND baseline = ?",
+      ).bind(minute - 1, baseline).first<{ n: number }>();
+      const { results: bucketRows } = await env.DB.prepare(
+        "INSERT INTO rate_counters (minute, baseline, n) VALUES (?, ?, 1) " +
+          "ON CONFLICT(minute, baseline) DO UPDATE SET n = n + 1 RETURNING n",
+      ).bind(minute, baseline).all<{ n: number }>();
+      const gate = allowTaskCreation(
+        openRow?.n ?? 0,
+        (prevRow?.n ?? 0) + (bucketRows[0]?.n ?? 1),
+        bearerOf(req) === `Bearer ${env.RELAY_TOKEN}`,
+      );
+      if (!gate.ok) return json({ error: gate.reason }, 429);
+
       const id = newTaskId();
 
       let workspaceRepo: string | null = null;
@@ -277,12 +310,24 @@ export default {
         await logEvent(env.DB, null, "merge.recovered", { count: rec.meta.changes });
       }
 
+      // recover abandoned 'assigned' tasks (runner/agent died; write token long expired)
+      const staleAssignedCut = new Date(Date.now() - ASSIGNED_TIMEOUT_MS).toISOString();
+      const recA = await env.DB.prepare(
+        "UPDATE tasks SET status='queued', updated_at=? WHERE status='assigned' AND updated_at < ?",
+      ).bind(now(), staleAssignedCut).run();
+      if (recA.meta.changes) {
+        await logEvent(env.DB, null, "task.recovered_assigned", { count: recA.meta.changes });
+      }
+
+      // opportunistic: drop rate-counter buckets older than an hour
+      await env.DB.prepare("DELETE FROM rate_counters WHERE minute < ?")
+        .bind(Math.floor(Date.now() / 60_000) - 60).run();
+
       const { results: awaiting } = await env.DB.prepare(
         "SELECT * FROM tasks WHERE status = 'awaiting_merge' ORDER BY created_at ASC LIMIT 1",
       ).all<Record<string, any>>();
       if (!awaiting.length) return json({ grants: [], reforked: [] });
 
-      const head = await baselineHead(env, env.RELAY_BASELINE);
       const grants: any[] = [];
       const reforked: any[] = [];
 
@@ -292,6 +337,10 @@ export default {
       ).all<Record<string, any>>();
 
       const task = awaiting[0];
+      // head of THIS task's baseline (not the default one) — the ff/rebase
+      // decision compares apples to apples; the merge executor still computes
+      // the true merge-base itself, so this only steers grant mode.
+      const head = await baselineHead(env, task.baseline_repo as string);
       const decision = decideMerge(task, mergedTasks, head);
       if (decision.action === "refork") {
         await reforkTask(env, task, `touch-set overlaps merged tasks: ${decision.overlaps.join(",")}`);
@@ -344,7 +393,7 @@ export default {
       return json({ task, events: events.results });
     }
 
-    const body = await req.json().catch(() => ({}));
+    const body = (await req.json().catch(() => ({}))) as Record<string, any>;
 
     // ---- POST /tasks/:id/claim {agent}
     if (req.method === "POST" && action === "claim") {
@@ -359,6 +408,7 @@ export default {
       ).bind(agent, now(), id).run();
       if (!res.meta.changes) return json({ error: "task not claimable" }, 409);
       const task = await getTask(env.DB, id);
+      if (!task) return json({ error: "task vanished after claim" }, 500);
       const fromStatus = existing.status as string;
       await logEvent(env.DB, id, "task.claimed", { agent, attempt: task.attempt, from: fromStatus });
       using ws = await env.ARTIFACTS.get(task.workspace_repo as string);
@@ -400,7 +450,8 @@ export default {
       }
       const ts = now();
       if (result === "pushed") {
-        const touchSet = Array.isArray(body.touch_set) ? body.touch_set.map(String) : [];
+        // touch_set is runner-reported; cap it so a hostile runner can't bloat D1
+        const touchSet = Array.isArray(body.touch_set) ? body.touch_set.map(String).slice(0, 500) : [];
         const diff = typeof body.diff === "string" ? body.diff : "";
         await env.DB.prepare(
           `UPDATE tasks SET status='pushed', touch_set=?, head_sha=?, checks=?, updated_at=? WHERE id=?`,

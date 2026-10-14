@@ -8,6 +8,12 @@ import {
   decideMerge,
   isStaleMerging,
   parseReviewOutput,
+  globToRegExp,
+  matchGlob,
+  normalizePolicy,
+  applyPolicy,
+  evalChecks,
+  DEFAULT_DENY,
 } from "../src/logic.ts";
 
 // ---------- workspaceName / parseWorkspace ----------
@@ -150,4 +156,98 @@ test("parseReviewOutput: garbage → ok:false with raw preserved", () => {
 test("parseReviewOutput: verdict normalization — anything not exactly 'approve' is reject", () => {
   const r = parseReviewOutput('{"verdict":"APPROVE"}');
   assert.equal(r.verdict, "reject");
+});
+
+// ---------- glob matching ----------
+
+test("globToRegExp: * within segment, ** across, ? single char", () => {
+  assert.equal(globToRegExp("*.ts").test("a.ts"), true);
+  assert.equal(globToRegExp("*.ts").test("src/a.ts"), false, "* must not cross /");
+  assert.equal(globToRegExp("src/**/*.ts").test("src/a/b/c.ts"), true);
+  assert.equal(globToRegExp("src/**/*.ts").test("src/a.ts"), true, "**/ should collapse");
+  assert.equal(globToRegExp("a?c").test("abc"), true);
+  assert.equal(globToRegExp("a?c").test("ac"), false);
+  assert.equal(globToRegExp(".env.*").test(".env.local"), true);
+  assert.equal(globToRegExp(".env.*").test("x.env.local"), false);
+});
+
+test("globToRegExp: regex metacharacters in patterns are literal", () => {
+  assert.equal(globToRegExp("a(b).md").test("a(b).md"), true);
+  assert.equal(globToRegExp("a+b.md").test("axb.md"), false);
+});
+
+test("matchGlob: DEFAULT_DENY catches env files, keys, workflow CI", () => {
+  for (const p of [".env", ".env.production", "secrets/id_rsa", "deploy/server.pem", ".github/workflows/deploy.yml"]) {
+    assert.equal(matchGlob(p, DEFAULT_DENY), true, p);
+  }
+  for (const p of ["src/index.ts", "docs/.env-example.md", "README.md"]) {
+    assert.equal(matchGlob(p, DEFAULT_DENY), false, p);
+  }
+});
+
+test("matchGlob: slash-less patterns match basenames at any depth; slashed stay anchored", () => {
+  assert.equal(matchGlob("a/b/c/notes.txt", ["*.txt"]), true);
+  assert.equal(matchGlob("a/b/c.ts", ["src/*.ts"]), false);
+  assert.equal(matchGlob("src/c.ts", ["src/*.ts"]), true);
+});
+
+// ---------- normalizePolicy ----------
+
+test("normalizePolicy: sanitizes unknown shapes, clamps numbers, keeps clean lists", () => {
+  const p = normalizePolicy({ allow: ["src/**", "", 42], deny: "not-a-list", max_files: 999999, max_diff_bytes: "5000" });
+  assert.deepEqual(p.allow, ["src/**"]);
+  assert.equal(p.deny, undefined);
+  assert.equal(p.max_files, 10000, "clamped to cap");
+  assert.equal(p.max_diff_bytes, 5000);
+  assert.deepEqual(normalizePolicy(null), {});
+  assert.deepEqual(normalizePolicy("junk"), {});
+});
+
+// ---------- applyPolicy ----------
+
+test("applyPolicy: default deny → deterministic reject with file named", () => {
+  const r = applyPolicy(null, ["src/a.ts", ".env"], 100);
+  assert.equal(r.ok, false);
+  assert.equal(r.violations.length, 1);
+  assert.match(r.violations[0].detail, /\.env/);
+  assert.match(r.instructions, /禁改清单/);
+});
+
+test("applyPolicy: allowlist excludes untouched areas; deny wins over allow", () => {
+  const r = applyPolicy({ allow: ["src/**"] }, ["src/a.ts", "docs/b.md"], 100);
+  assert.equal(r.ok, false);
+  assert.equal(r.violations[0].rule, "allow");
+  // even an allowed path is denied if it hits deny
+  const r2 = applyPolicy({ allow: ["**"] }, ["prod.pem"], 100);
+  assert.equal(r2.ok, false);
+  assert.equal(r2.violations[0].rule, "deny");
+});
+
+test("applyPolicy: max_files and max_diff_bytes", () => {
+  assert.equal(applyPolicy({ max_files: 2 }, ["a", "b", "c"], 10).ok, false);
+  assert.equal(applyPolicy(null, ["a"], 200001).ok, false);
+  assert.equal(applyPolicy({ max_diff_bytes: 300000 }, ["a"], 200001).ok, true);
+  assert.equal(applyPolicy(null, ["a", "b"], 100).ok, true);
+});
+
+test("applyPolicy: extra user deny extends the default", () => {
+  const r = applyPolicy({ deny: ["migrations/**"] }, ["migrations/001.sql"], 10);
+  assert.equal(r.ok, false);
+  assert.equal(r.violations[0].rule, "deny");
+});
+
+// ---------- evalChecks ----------
+
+test("evalChecks: failing test exit → not ok, instructions carry the tail", () => {
+  const r = evalChecks({ tests: { cmd: "npm test", exit: 1, tail: "AssertionError: expected 2" } });
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.failed, ["tests"]);
+  assert.match(r.instructions, /AssertionError/);
+});
+
+test("evalChecks: passing exits ok; absent checks not judged; exit 0 lint ok", () => {
+  assert.equal(evalChecks({ tests: { exit: 0 }, lint: { exit: 0 } }).ok, true);
+  assert.equal(evalChecks(null).ok, true);
+  assert.equal(evalChecks({ tests: { cmd: "npm test", tail: "no exit recorded" } }).ok, true);
+  assert.deepEqual(evalChecks({ tests: null, lint: { exit: 3, tail: "eslint error" } }).failed, ["lint"]);
 });

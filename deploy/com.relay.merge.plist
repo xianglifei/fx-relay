@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Resident merge executor for macOS (launchd). Adjust RUNNER_DIR + proxy, then:
+     cp deploy/com.relay.merge.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.relay.merge.plist
+     Logs: RUNNER_DIR/relay-merge.log (gitignored). Uninstall: launchctl unload + rm. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.relay.merge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>RUNNER_DIR/bin/relay-runner.mjs</string>
+    <string>merge</string>
+  </array>
+
+  <!-- workers.dev is blocked on some networks; route via the local proxy when present.
+       NODE_USE_ENV_PROXY makes Node's fetch honor *_PROXY (Node 24+). -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NODE_USE_ENV_PROXY</key>
+    <string>1</string>
+    <key>HTTPS_PROXY</key>
+    <string>http://127.0.0.1:7897</string>
+    <key>https_proxy</key>
+    <string>http://127.0.0.1:7897</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>RUNNER_DIR/relay-merge.log</string>
+  <key>StandardErrorPath</key>
+  <string>RUNNER_DIR/relay-merge.log</string>
+</dict>
+</plist>

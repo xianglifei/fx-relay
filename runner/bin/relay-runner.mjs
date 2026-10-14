@@ -3,12 +3,15 @@
  * relay-runner — the execution plane.
  *
  * Commands:
- *   relay-runner seed  --dir ../baseline-template [--repo demo-app]
- *   relay-runner work  --agent zcode|claude|codebuddy|dsh [--once]
- *   relay-runner merge [--once]          # merge-grant executor (rebase/ff onto mainline)
+ *   relay-runner task   "spec..." [--file SPEC.md] [--baseline NAME] [--needs-human]
+ *                      [--allow g1,g2] [--deny g1] [--max-files N]   # submit a task (submit token ok)
+ *   relay-runner attach --dir /path/to/repo --repo NAME              # onboard an existing git repo
+ *   relay-runner seed  --dir ../baseline-template [--repo demo-app]  # seed a template dir
+ *   relay-runner work  --agent zcode|claude|codebuddy [--once]       # claim + drive a coding agent
+ *   relay-runner merge [--once]          # schedule + merge-grant executor (ff / cherry-pick onto mainline)
  *   relay-runner config <url> <token>
  *
- * The runner owns commit, notes and push — the agent only edits files.
+ * The runner owns commit, notes, push — the agent only edits files.
  */
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
@@ -27,13 +30,15 @@ async function cfg() {
   return {
     url: process.env.RELAY_URL || file.url,
     token: process.env.RELAY_TOKEN || file.token,
+    submit_token: process.env.RELAY_SUBMIT_TOKEN || file.submit_token || null,
   };
 }
 
-async function api(pathname, init = {}) {
-  const { url, token } = await cfg();
-  if (!url || !token) throw new Error("missing RELAY_URL / RELAY_TOKEN (run `relay-runner config`)");
-  const res = await fetch(url.replace(/\/$/, "") + pathname, {
+async function api(pathname, init = {}, tokenOverride) {
+  const c = await cfg();
+  const token = tokenOverride || c.token;
+  if (!c.url || !token) throw new Error("missing RELAY_URL / RELAY_TOKEN (run `relay-runner config`)");
+  const res = await fetch(c.url.replace(/\/$/, "") + pathname, {
     ...init,
     headers: {
       authorization: `Bearer ${token}`,
@@ -47,13 +52,27 @@ async function api(pathname, init = {}) {
 }
 
 function sh(cmd, args, opts = {}) {
+  const { timeoutMs, ...spawnOpts } = opts;
   return new Promise((resolve) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...opts });
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...spawnOpts });
     let out = "";
+    let timer = null;
+    if (timeoutMs) {
+      timer = setTimeout(() => {
+        p.kill("SIGKILL");
+        out += `\n[runner] timed out after ${Math.round(timeoutMs / 1000)}s`;
+      }, timeoutMs);
+    }
     p.stdout.on("data", (d) => (out += d));
     p.stderr.on("data", (d) => (out += d));
-    p.on("close", (code) => resolve({ code, out }));
-    p.on("error", (err) => resolve({ code: -1, out: String(err) }));
+    p.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      resolve({ code, out });
+    });
+    p.on("error", (err) => {
+      if (timer) clearTimeout(timer);
+      resolve({ code: -1, out: String(err) });
+    });
   });
 }
 
@@ -148,6 +167,43 @@ async function workOnce(agent) {
   return true; // all lost to races; caller loops
 }
 
+/**
+ * Deterministic trust gate: run the baseline's test/lint scripts against the
+ * agent's tree. Scripts are read from the FORK BASE, not the agent's HEAD —
+ * an agent cannot escape the gate by deleting the test script.
+ * Returns null when the baseline defines no scripts (nothing to judge).
+ */
+async function runBaseChecks(repo, baseSha) {
+  const pkgRaw = (await git(repo, "show", `${baseSha}:package.json`)).out;
+  if (!pkgRaw.trim().startsWith("{")) return null;
+  let scripts = {};
+  try { scripts = JSON.parse(pkgRaw).scripts ?? {}; } catch { return null; }
+  const hasTest = typeof scripts.test === "string" && scripts.test.trim();
+  const hasLint = typeof scripts.lint === "string" && scripts.lint.trim();
+  if (!hasTest && !hasLint) return null;
+
+  console.log(`[runner] deterministic gate: installing deps (base scripts: ${[hasTest && "test", hasLint && "lint"].filter(Boolean).join(", ")})`);
+  const ci = await sh("npm", ["ci", "--no-audit", "--no-fund", "--silent"], { cwd: repo, timeoutMs: 10 * 60 * 1000 });
+  if (ci.code !== 0) {
+    const ins = await sh("npm", ["install", "--no-audit", "--no-fund", "--silent"], { cwd: repo, timeoutMs: 10 * 60 * 1000 });
+    if (ins.code !== 0) {
+      return { tests: { cmd: "npm ci/install (deps for deterministic gate)", exit: -1, tail: (ci.out + "\n" + ins.out).slice(-1500) } };
+    }
+  }
+  const checks = {};
+  if (hasTest) {
+    const r = await sh("npm", ["test", "--silent"], { cwd: repo, timeoutMs: 10 * 60 * 1000 });
+    checks.tests = { cmd: "npm test", exit: r.code, tail: r.out.slice(-2000) };
+    console.log(`[runner] npm test exit=${r.code}`);
+  }
+  if (hasLint) {
+    const r = await sh("npm", ["run", "--silent", "lint"], { cwd: repo, timeoutMs: 5 * 60 * 1000 });
+    checks.lint = { cmd: "npm run lint", exit: r.code, tail: r.out.slice(-2000) };
+    console.log(`[runner] npm run lint exit=${r.code}`);
+  }
+  return checks;
+}
+
 async function executeTask(task, fromStatus, agent) {
   console.log(`[runner] claimed ${task.id} (attempt ${task.attempt}, from ${fromStatus})`);
   console.log(`[runner] spec: ${task.spec}`);
@@ -200,6 +256,13 @@ async function executeTask(task, fromStatus, agent) {
     if (push.code !== 0) throw new Error(`push failed: ${push.out}`);
     await gitAuth(repo, task.write_token, "push", "origin", "+refs/notes/commits");
 
+    // deterministic gate after push: the workspace keeps the agent's commits
+    // (remediation needs them), but the kernel will reject on failing checks.
+    const checks = await runBaseChecks(repo, baseSha);
+    if (checks) provenance.checks = Object.fromEntries(
+      Object.entries(checks).map(([k, v]) => [k, { cmd: v.cmd, exit: v.exit }]),
+    );
+
     const diff = await git(repo, "diff", "--name-only", `${baseSha}..HEAD`);
     const touchSet = diff.out.split("\n").map((s) => s.trim()).filter(Boolean);
     const patch = (await git(repo, "diff", `${baseSha}..HEAD`)).out.slice(0, 60000);
@@ -212,6 +275,7 @@ async function executeTask(task, fromStatus, agent) {
         touch_set: touchSet,
         diff: patch,
         provenance,
+        checks,
       }),
     });
     const review = report.review;
@@ -231,6 +295,11 @@ async function executeTask(task, fromStatus, agent) {
  * reported so the kernel re-forks and an agent redoes the task.
  */
 async function mergeOnce() {
+  // self-scheduling: the merge loop drives the scheduler too, so a resident
+  // merger is a complete unattended loop (no external /schedule cron needed)
+  await api("/schedule", { method: "POST" }).catch((e) => {
+    console.error(`[merge] schedule skipped: ${e.message}`);
+  });
   const { grant } = await api("/merge/next");
   if (!grant) return false;
   const { task_id, workspace_remote, baseline_remote, read_token, baseline_token } = grant;
@@ -331,6 +400,57 @@ async function seedBaseline(dir, repoName) {
   }
 }
 
+/**
+ * Attach an existing git repository: bootstrap the Artifacts repo and push the
+ * committed history of the current branch — the source working tree is never touched.
+ */
+async function attachExisting(dir, repoName) {
+  if (!repoName) throw new Error("usage: relay-runner attach --dir /path/to/repo --repo NAME");
+  const abs = path.resolve(process.cwd(), dir || ".");
+  if (!existsSync(path.join(abs, ".git"))) {
+    throw new Error(`${abs} 不是 git 仓库(模板目录请用 seed)`);
+  }
+  const branch = (await git(abs, "symbolic-ref", "--short", "HEAD")).out.trim();
+  if (!branch) throw new Error("源仓库处于 detached HEAD 或无提交,无法 attach");
+  const dirty = (await git(abs, "status", "--porcelain")).out.trim();
+  if (dirty) console.log("[attach] ⚠ 源仓库有未提交改动,它们不会进入基线(只推送已提交历史)");
+
+  const boot = await api("/bootstrap", {
+    method: "POST",
+    body: JSON.stringify({ repo: repoName, description: `Relay baseline ${repoName} (attached)` }),
+  });
+  console.log(`[attach] repo ${boot.name} -> ${boot.remote}`);
+  const push = await gitAuth(abs, boot.token, "push", "-f", boot.remote, `${branch}:main`);
+  if (push.code !== 0) throw new Error(`attach push failed: ${push.out}`);
+  console.log(`[attach] ${repoName} ← ${abs}@${branch} (已提交历史)`);
+  console.log(`[attach] 提交任务: relay-runner task "做某事" --baseline ${repoName}`);
+}
+
+/** Submit a task — one-liner for humans; submit token is used when configured. */
+async function submitTask(flags, pos) {
+  let spec = flags.file ? await readFile(path.resolve(String(flags.file)), "utf8") : pos[0];
+  if (!spec || !spec.trim()) throw new Error('usage: relay-runner task "spec..." [--file SPEC.md] [--baseline NAME] [--needs-human]');
+  spec = spec.trim();
+  const body = { spec };
+  if (flags.baseline) body.baseline = String(flags.baseline);
+  if (flags["needs-human"] || flags.needs_human) body.needs_human_review = true;
+  const list = (v) => String(v).split(",").map((s) => s.trim()).filter(Boolean);
+  const policy = {};
+  if (flags.allow) policy.allow = list(flags.allow);
+  if (flags.deny) policy.deny = list(flags.deny);
+  if (flags["max-files"]) policy.max_files = Number(flags["max-files"]);
+  if (Object.keys(policy).length) body.policy = policy;
+  const c = await cfg();
+  const task = await api("/tasks", { method: "POST", body: JSON.stringify(body) }, c.submit_token || undefined);
+  const extra = [
+    task.needs_human_review ? "需人审" : null,
+    task.policy ? "policy" : null,
+  ].filter(Boolean).join(", ");
+  console.log(`[task] ${task.id} 已创建 (baseline ${task.baseline_repo}${extra ? ", " + extra : ""})`);
+  console.log(`[task] 看板: ${c.url}/  |  认领: relay-runner work --agent claude`);
+  return task;
+}
+
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const flags = {};
@@ -356,6 +476,14 @@ async function main() {
     await seedBaseline(flags.dir || "../baseline-template", flags.repo || "demo-app");
     return;
   }
+  if (cmd === "attach") {
+    await attachExisting(flags.dir || ".", flags.repo);
+    return;
+  }
+  if (cmd === "task") {
+    await submitTask(flags, pos);
+    return;
+  }
   if (cmd === "work") {
     const agent = flags.agent || "claude";
     console.log(`[runner] agent=${agent} once=${!!flags.once}`);
@@ -365,10 +493,14 @@ async function main() {
       return;
     }
     for (;;) {
-      const did = await workOnce(agent).catch((e) => {
+      let did = true;
+      try {
+        did = await workOnce(agent);
+      } catch (e) {
         console.error(`[runner] error: ${e.message}`);
-        return true;
-      });
+        await new Promise((r) => setTimeout(r, 15000)); // daemon mode: back off, don't hot-loop
+        continue;
+      }
       if (!did) await new Promise((r) => setTimeout(r, 5000));
     }
   }
@@ -380,14 +512,24 @@ async function main() {
       return;
     }
     for (;;) {
-      const did = await mergeOnce().catch((e) => {
+      let did = true;
+      try {
+        did = await mergeOnce();
+      } catch (e) {
         console.error(`[merge] error: ${e.message}`);
-        return true;
-      });
+        await new Promise((r) => setTimeout(r, 15000)); // daemon mode: back off, don't hot-loop
+        continue;
+      }
       if (!did) await new Promise((r) => setTimeout(r, 5000));
     }
   }
-  console.error("usage: relay-runner <config|seed|work|merge> [--agent NAME] [--once] [--dir DIR] [--repo NAME]");
+  console.error("usage: relay-runner <task|attach|seed|work|merge|config> [args]");
+  console.error("  task   \"spec...\" [--file SPEC.md] [--baseline NAME] [--needs-human] [--allow g,...] [--deny g,...] [--max-files N]");
+  console.error("  attach --dir /path/to/repo --repo NAME");
+  console.error("  seed   --dir ../baseline-template [--repo demo-app]");
+  console.error("  work   --agent claude|codebuddy|zcode [--once]");
+  console.error("  merge  [--once]");
+  console.error("  config <url> <token>");
 }
 
 main().catch((e) => {

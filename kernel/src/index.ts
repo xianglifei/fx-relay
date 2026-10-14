@@ -1,9 +1,11 @@
 /**
  * relay-kernel — a Git collaboration kernel for AI agents.
  *
- * Day 2 control plane:
+ * Control plane:
  *  - task birth: fork-per-task, short repo-scoped tokens
- *  - review agent: Workers AI structured verdict (approve/reject + machine instructions)
+ *  - trust gate: deterministic policy + local checks BEFORE the review agent
+ *  - review agent: Workers AI structured verdict — fail-closed (errors suspend, never pass)
+ *  - human gate: needs_human_review flag / review failures suspend for a human decision
  *  - merge scheduler: touch-set intersection → fast-forward grants or auto re-fork
  *  - provenance: git notes on commits, indexed in D1
  *
@@ -15,6 +17,7 @@ export interface Env {
   AI: Ai;
   DB: D1Database;
   RELAY_TOKEN: string;
+  RELAY_SUBMIT_TOKEN?: string;
   RELAY_NAMESPACE: string;
   RELAY_BASELINE: string;
 }
@@ -27,6 +30,9 @@ import {
   decideMerge,
   isStaleMerging,
   parseReviewOutput,
+  applyPolicy,
+  evalChecks,
+  normalizePolicy,
 } from "./logic";
 
 const json = (data: unknown, status = 200) =>
@@ -54,8 +60,16 @@ async function getTask(db: D1Database, id: string) {
   return db.prepare("SELECT * FROM tasks WHERE id = ?").bind(id).first<Record<string, any>>();
 }
 
+const bearerOf = (req: Request) => req.headers.get("authorization") ?? "";
+
 async function authed(req: Request, env: Env): Promise<boolean> {
-  return (req.headers.get("authorization") ?? "") === `Bearer ${env.RELAY_TOKEN}`;
+  return bearerOf(req) === `Bearer ${env.RELAY_TOKEN}`;
+}
+
+/** Read + task-submission access: admin token or the optional submit token. */
+async function authSubmitter(req: Request, env: Env): Promise<boolean> {
+  if (await authed(req, env)) return true;
+  return !!env.RELAY_SUBMIT_TOKEN && bearerOf(req) === `Bearer ${env.RELAY_SUBMIT_TOKEN}`;
 }
 
 /** Current baseline head sha (null if indexing lags). */
@@ -127,9 +141,21 @@ export async function reviewTask(env: Env, task: Record<string, any>, diff: stri
         model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
       };
     }
-    return { verdict: "approve", reason: "review parse failed, auto-approved", instructions: "", model: "fallback", raw: parsed.raw };
+    // fail-closed: unparseable verdict suspends for a human, never auto-approves
+    return {
+      verdict: "needs_human",
+      reason: "审查输出无法解析,已挂起等待人工裁决",
+      instructions: "",
+      model: "fallback",
+      raw: parsed.raw,
+    };
   } catch (e) {
-    return { verdict: "approve", reason: `review agent error, auto-approved: ${String(e).slice(0, 200)}`, instructions: "", model: "fallback" };
+    return {
+      verdict: "needs_human",
+      reason: `审查 agent 调用失败,已挂起等待人工裁决: ${String(e).slice(0, 200)}`,
+      instructions: "",
+      model: "fallback",
+    };
   }
 }
 
@@ -146,7 +172,11 @@ export default {
     }
 
     if (req.method === "GET" && path === "/healthz") return json({ ok: true, ts: now() });
-    if (!(await authed(req, env))) return json({ error: "unauthorized" }, 401);
+    // Reads and task submission accept the (optional) submit token; everything else is admin-only.
+    const readPath = path === "/events" || path === "/provenance" || path === "/tasks" || path.startsWith("/tasks/");
+    const submitRoute = (req.method === "GET" && readPath) || (req.method === "POST" && path === "/tasks");
+    if (!(await (submitRoute ? authSubmitter(req, env) : authed(req, env))))
+      return json({ error: "unauthorized" }, 401);
 
     // ---- GET /events — global activity feed
     if (req.method === "GET" && path === "/events") {
@@ -211,13 +241,15 @@ export default {
       }
 
       const ts = now();
+      const policy = body.policy ? JSON.stringify(normalizePolicy(body.policy)) : null;
+      const needsHuman = body.needs_human_review === true ? 1 : 0;
       await env.DB.prepare(
-        `INSERT INTO tasks (id, spec, baseline_repo, workspace_repo, workspace_remote, fork_base_sha, status, attempt, forked_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)`,
+        `INSERT INTO tasks (id, spec, baseline_repo, workspace_repo, workspace_remote, fork_base_sha, status, attempt, policy, needs_human_review, forked_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)`,
       )
-        .bind(id, spec, baseline, workspaceRepo, workspaceRemote, forkBaseSha, ts, ts, ts)
+        .bind(id, spec, baseline, workspaceRepo, workspaceRemote, forkBaseSha, policy, needsHuman, ts, ts, ts)
         .run();
-      await logEvent(env.DB, id, "task.created", { spec, baseline, workspaceRepo, forkBaseSha });
+      await logEvent(env.DB, id, "task.created", { spec, baseline, workspaceRepo, forkBaseSha, needs_human_review: needsHuman === 1, policy: policy ? JSON.parse(policy) : null });
       return json(await getTask(env.DB, id), 201);
     }
 
@@ -368,9 +400,11 @@ export default {
       }
       const ts = now();
       if (result === "pushed") {
+        const touchSet = Array.isArray(body.touch_set) ? body.touch_set.map(String) : [];
+        const diff = typeof body.diff === "string" ? body.diff : "";
         await env.DB.prepare(
-          `UPDATE tasks SET status='pushed', touch_set=?, head_sha=?, updated_at=? WHERE id=?`,
-        ).bind(JSON.stringify(body.touch_set ?? []), body.head_sha ?? null, ts, id).run();
+          `UPDATE tasks SET status='pushed', touch_set=?, head_sha=?, checks=?, updated_at=? WHERE id=?`,
+        ).bind(JSON.stringify(touchSet), body.head_sha ?? null, body.checks ? JSON.stringify(body.checks).slice(0, 8000) : null, ts, id).run();
         if (body.provenance) {
           await env.DB.prepare(
             `INSERT OR REPLACE INTO provenance (repo, commit_sha, task_id, agent, model, note, created_at) VALUES (?,?,?,?,?,?,?)`,
@@ -381,18 +415,46 @@ export default {
             .run();
         }
         await logEvent(env.DB, id, "task.pushed", {
-          head_sha: body.head_sha, touch_set: body.touch_set, agent: task.assigned_agent,
+          head_sha: body.head_sha, touch_set: touchSet, agent: task.assigned_agent,
         });
 
-        // ---- review agent, inline
-        const verdict = await reviewTask(env, task, body.diff ?? "");
+        // ---- trust gate 1: deterministic policy (deny/allow/max_files/max_diff) — no AI involved
+        const policy = applyPolicy(safeParse(task.policy), touchSet, diff.length);
+        if (!policy.ok) {
+          const verdict = { verdict: "reject", reason: `策略拦截: ${policy.violations.map((v) => v.detail).join("; ").slice(0, 300)}`, instructions: policy.instructions, model: "policy" };
+          await env.DB.prepare(`UPDATE tasks SET status='review_failed', review=?, updated_at=? WHERE id=?`)
+            .bind(JSON.stringify(verdict), now(), id).run();
+          await logEvent(env.DB, id, "review.policy_rejected", { violations: policy.violations });
+          return json({ ...(await getTask(env.DB, id)), review: verdict });
+        }
+
+        // ---- trust gate 2: deterministic local checks (tests/lint run by the runner against base scripts)
+        const checks = evalChecks(body.checks);
+        if (!checks.ok) {
+          const verdict = { verdict: "reject", reason: `本地检查未通过: ${checks.failed.join(", ")}`, instructions: checks.instructions, model: "checks" };
+          await env.DB.prepare(`UPDATE tasks SET status='review_failed', review=?, updated_at=? WHERE id=?`)
+            .bind(JSON.stringify(verdict), now(), id).run();
+          await logEvent(env.DB, id, "review.checks_failed", { failed: checks.failed });
+          return json({ ...(await getTask(env.DB, id)), review: verdict });
+        }
+
+        // ---- trust gate 3: review agent (fail-closed — errors suspend, never pass)
+        const verdict = await reviewTask(env, task, diff);
+        const nextStatus =
+          verdict.verdict === "approve"
+            ? task.needs_human_review
+              ? "needs_human"
+              : "awaiting_merge"
+            : verdict.verdict === "needs_human"
+              ? "needs_human"
+              : "review_failed";
         await env.DB.prepare(
           `UPDATE tasks SET status=?, review=?, updated_at=? WHERE id=?`,
-        ).bind(
-          verdict.verdict === "approve" ? "awaiting_merge" : "review_failed",
-          JSON.stringify(verdict), now(), id,
-        ).run();
-        await logEvent(env.DB, id, verdict.verdict === "approve" ? "review.approved" : "review.rejected", verdict);
+        ).bind(nextStatus, JSON.stringify(verdict), now(), id).run();
+        await logEvent(env.DB, id,
+          verdict.verdict === "approve" ? "review.approved"
+            : verdict.verdict === "needs_human" ? "review.held"
+              : "review.rejected", verdict);
         return json({ ...(await getTask(env.DB, id)), review: verdict });
       }
 
@@ -419,6 +481,31 @@ export default {
         touch_set: body.touch_set ?? null,
       });
       return json(await getTask(env.DB, id));
+    }
+
+    // ---- POST /tasks/:id/human_review {decision: approve|reject, note?} — resolve a suspended task (admin)
+    if (req.method === "POST" && action === "human_review") {
+      const task = await getTask(env.DB, id);
+      if (!task) return json({ error: "task not found" }, 404);
+      if (task.status !== "needs_human")
+        return json({ error: `human_review only applies to needs_human tasks, task is '${task.status}'` }, 409);
+      const decision = body.decision === "approve" ? "approve" : body.decision === "reject" ? "reject" : null;
+      if (!decision) return json({ error: "decision must be 'approve' or 'reject'" }, 400);
+      const note = String(body.note ?? "").slice(0, 300);
+      const prev = safeParse(task.review) ?? {};
+      const review = {
+        ...prev,
+        verdict: decision,
+        reason: `人工${decision === "approve" ? "放行" : "打回"}${note ? `:${note}` : ""}`,
+        instructions: decision === "reject" ? note || "人工打回,请对照任务规格重做" : "",
+        model: "human",
+        human: true,
+      };
+      await env.DB.prepare(
+        `UPDATE tasks SET status=?, review=?, updated_at=? WHERE id=?`,
+      ).bind(decision === "approve" ? "awaiting_merge" : "review_failed", JSON.stringify(review), now(), id).run();
+      await logEvent(env.DB, id, decision === "approve" ? "review.human_approved" : "review.human_rejected", { note });
+      return json({ ...(await getTask(env.DB, id)), review });
     }
 
     return json({ error: "not found" }, 404);

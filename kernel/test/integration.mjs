@@ -15,10 +15,12 @@ import process from "node:process";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..", "runner");
 const LOCAL_CFG = path.join(ROOT, "relay.local.json");
-let { url, token } = existsSync(LOCAL_CFG) ? JSON.parse(await readFile(LOCAL_CFG, "utf8")) : {};
+let { url, token, submit_token } = existsSync(LOCAL_CFG) ? JSON.parse(await readFile(LOCAL_CFG, "utf8")) : {};
 const argv = process.argv.slice(2);
 if (argv.includes("--url")) url = argv[argv.indexOf("--url") + 1];
 if (argv.includes("--token")) token = argv[argv.indexOf("--token") + 1];
+if (argv.includes("--submit-token")) submit_token = argv[argv.indexOf("--submit-token") + 1];
+if (process.env.RELAY_SUBMIT_TOKEN) submit_token = process.env.RELAY_SUBMIT_TOKEN;
 if (!url || !token) throw new Error("need --url/--token or runner/relay.local.json");
 url = url.replace(/\/$/, "");
 
@@ -93,6 +95,8 @@ async function mergeGrant(taskId) {
   return all.find((g) => g.task_id === taskId) || null;
 }
 
+let mainlineCommits = 0; // every executeMerge() replays exactly one task commit onto the mainline
+
 async function executeMerge(taskId) {
   const next = await api("/merge/next");
   expect(next.body.grant, `no grant for ${taskId}: ${JSON.stringify(next.body)}`);
@@ -115,12 +119,14 @@ async function executeMerge(taskId) {
     mergedSha = sh(`git -C ${base} rev-parse HEAD`).trim();
   }
   gitAuth(base, g.baseline_token, "push origin HEAD:main");
+  const replayed = Number(sh(`git -C ${base} rev-list --count ${baseHead}..${mergedSha}`).trim()) || 1;
   await rm(wd, { recursive: true, force: true });
   const done = await api(`/tasks/${taskId}/merged`, {
     method: "POST",
     body: JSON.stringify({ merged_sha: mergedSha, rebased: mb !== baseHead }),
   });
   expect(done.status === 200, `merged report failed: ${JSON.stringify(done.body)}`);
+  mainlineCommits += replayed;
   return mergedSha;
 }
 
@@ -242,15 +248,100 @@ await t("T7 race-task cleanup path: failed report accepted from assigned", async
   expect(r.status === 200 && r.body.status === "failed", `got ${r.status} ${JSON.stringify(r.body).slice(0, 120)}`);
 });
 
+await t("T9 policy gate: touching .env → deterministic reject (no AI); re-claim carries instructions", async () => {
+  const mk = await api("/tasks", { method: "POST", body: JSON.stringify({ spec: "[test] policy: 写一个环境变量文件", baseline: BASELINE }) });
+  const tid = mk.body.id; testTaskIds.add(tid);
+  const { report } = await claimAndPush(tid, "policy", { ".env": "SECRET=itest\n" });
+  expect(report.status === "review_failed", `status: ${report.status}`);
+  expect(report.review?.model === "policy", `review model not policy: ${JSON.stringify(report.review)}`);
+  expect(/禁改清单|deny/.test(report.review?.instructions ?? ""), `instructions: ${report.review?.instructions}`);
+  const c = await api(`/tasks/${tid}/claim`, { method: "POST", body: JSON.stringify({ agent: "itest-fix" }) });
+  expect(c.status === 200 && (c.body.review?.instructions ?? "").includes(".env"), "re-claim lacks policy instructions");
+  // cleanup: leave the task in a terminal-ish state for row deletion
+  await api(`/tasks/${tid}/report`, { method: "POST", body: JSON.stringify({ result: "failed", detail: "itest policy cleanup" }) });
+});
+
+await t("T10 human gate: needs_human_review → suspended → human reject → remediate → human approve → merge", async () => {
+  const mk = await api("/tasks", { method: "POST", body: JSON.stringify({ spec: "[test] 人审:新建 HUMAN.md,内容为一行 human-gate-ok,不改动其他文件", baseline: BASELINE, needs_human_review: true }) });
+  const tid = mk.body.id; testTaskIds.add(tid);
+  expect(mk.body.needs_human_review === 1, `flag not stored: ${mk.body.needs_human_review}`);
+  const { report } = await claimAndPush(tid, "human-gate", { "HUMAN.md": "human-gate-ok\n" });
+  if (report.status === "review_failed") {
+    warned++; console.log("      ⚠ reviewer rejected before the human gate — gate path untested this run");
+    return;
+  }
+  expect(report.status === "needs_human", `expected needs_human, got ${report.status}`);
+  // human reject with a remediation note
+  const rej = await api(`/tasks/${tid}/human_review`, { method: "POST", body: JSON.stringify({ decision: "reject", note: "itest: 内容改为 human-gate-fixed" }) });
+  expect(rej.status === 200 && rej.body.status === "review_failed", `human reject: ${JSON.stringify(rej.body).slice(0, 150)}`);
+  expect(rej.body.review?.model === "human", "human review model missing");
+  // re-claim carries the human note as remediation instructions (server-side state)
+  const c = await api(`/tasks/${tid}/claim`, { method: "POST", body: JSON.stringify({ agent: "itest-fixer" }) });
+  expect(c.status === 200 && (c.body.review?.instructions ?? "").includes("human-gate-fixed"), "re-claim lacks human note");
+  // remediate on the same workspace with the re-claim's token
+  const wd = await mkdtemp(path.join(os.tmpdir(), "ihfix-"));
+  const repo = path.join(wd, "repo");
+  gitAuth(wd, c.body.write_token, `clone ${c.body.workspace_remote} repo`);
+  sh(`git -C ${repo} config user.email itest@relay.local && git -C ${repo} config user.name itest`);
+  await writeFile(path.join(repo, "HUMAN.md"), "human-gate-fixed\n");
+  sh(`git -C ${repo} add -A && git -C ${repo} commit -m "task: itest human-gate fix"`);
+  gitAuth(repo, c.body.write_token, "push origin HEAD:main");
+  const headSha = sh(`git -C ${repo} rev-parse HEAD`).trim();
+  const diff = sh(`git -C ${repo} diff HEAD~1..HEAD`);
+  await rm(wd, { recursive: true, force: true });
+  const rep2 = await api(`/tasks/${tid}/report`, {
+    method: "POST",
+    body: JSON.stringify({ result: "pushed", head_sha: headSha, touch_set: ["HUMAN.md"], diff, provenance: { agent: "itest-fixer", model: "integration-test", spec_digest: "human-gate fix" } }),
+  });
+  expect(rep2.status === 200, `fix report failed: ${JSON.stringify(rep2.body).slice(0, 150)}`);
+  if (rep2.body.status === "review_failed") {
+    warned++; console.log("      ⚠ reviewer rejected the fix — human approve path untested this run");
+    return;
+  }
+  expect(rep2.body.status === "needs_human", `expected needs_human after fix, got ${rep2.body.status}`);
+  // human approve → merge
+  const app = await api(`/tasks/${tid}/human_review`, { method: "POST", body: JSON.stringify({ decision: "approve" }) });
+  expect(app.status === 200 && app.body.status === "awaiting_merge", `human approve: ${JSON.stringify(app.body).slice(0, 150)}`);
+  const grant = await mergeGrant(tid);
+  expect(grant, `no grant after human approve: ${JSON.stringify(grant)}`);
+  await executeMerge(tid);
+  expect((await taskStatus(tid)).status === "merged", "not merged");
+});
+
+await t("T10b human_review guard: non-needs_human task → 409", async () => {
+  const r = await api(`/tasks/${lifeTaskId}/human_review`, { method: "POST", body: JSON.stringify({ decision: "approve" }) });
+  expect(r.status === 409, `expected 409, got ${r.status}`);
+});
+
+await t("T11 token split: submit token can read+create but cannot schedule/claim", async () => {
+  if (!submit_token) { warned++; console.log("      ⚠ no submit token provided (--submit-token) — skipped"); return; }
+  const h = { authorization: `Bearer ${submit_token}`, "content-type": "application/json" };
+  const read = await fetch(url + "/tasks", { headers: h });
+  expect(read.status === 200, `submit token read: ${read.status}`);
+  const mk = await fetch(url + "/tasks", { method: "POST", headers: h, body: JSON.stringify({ spec: "[test] auth: submit token 提交(不执行)", baseline: BASELINE }) });
+  expect(mk.status === 201, `submit create: ${mk.status}`);
+  const created = await mk.json();
+  testTaskIds.add(created.id);
+  const sched = await fetch(url + "/schedule", { method: "POST", headers: h });
+  expect(sched.status === 401, `submit schedule should 401, got ${sched.status}`);
+  const claim = await fetch(`${url}/tasks/${created.id}/claim`, { method: "POST", headers: h, body: JSON.stringify({ agent: "nope" }) });
+  expect(claim.status === 401, `submit claim should 401, got ${claim.status}`);
+  const hr = await fetch(`${url}/tasks/${created.id}/human_review`, { method: "POST", headers: h, body: JSON.stringify({ decision: "approve" }) });
+  expect(hr.status === 401 || hr.status === 409, `submit human_review: ${hr.status}`);
+  // admin token still schedules fine
+  const admin = await api("/schedule", { method: "POST" });
+  expect(admin.status === 200, `admin schedule broken: ${admin.status}`);
+});
+
 await t("T8 mainline linear: test baseline log contains all merged task commits", async () => {
   const boot = await api("/bootstrap", { method: "POST", body: JSON.stringify({ repo: BASELINE }) });
   const wd = await mkdtemp(path.join(os.tmpdir(), "iverify-"));
   gitAuth(wd, boot.body.token, `clone ${boot.body.remote} chk`);
   const log = sh(`git -C ${wd}/chk log --oneline`);
   await rm(wd, { recursive: true, force: true });
-  expect(/itest change/.test(log), `merged commits missing from mainline:\n${log.slice(0, 400)}`);
+  expect(/itest change|task: itest/.test(log), `merged commits missing from mainline:\n${log.slice(0, 400)}`);
   const count = log.trim().split("\n").length;
-  expect(count === 1 + 2 + 1, `expected exactly 4 commits on test mainline (seed+T4+T6x2), got ${count}\n${log}`);
+  expect(count === 1 + mainlineCommits, `expected exactly ${1 + mainlineCommits} commits on test mainline (seed+${mainlineCommits} merged), got ${count}\n${log}`);
 });
 
 console.log(`\n■ ${passed} passed, ${failed} failed, ${warned} warnings`);

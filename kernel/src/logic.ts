@@ -110,6 +110,164 @@ const flattenAi = (v: unknown): string => {
  * Handles: plain string | {response} | {choices:[{message:{content}}]} | content-block arrays;
  * verdict normalizes to approve|reject (anything unparseable → ok:false, caller decides fallback).
  */
+// ---------- deterministic policy layer (the trust gate below the LLM) ----------
+
+export interface TaskPolicy {
+  allow?: string[]; // glob allowlist; unset = allow everything not denied
+  deny?: string[]; // extra deny globs on top of DEFAULT_DENY
+  max_files?: number; // default 200
+  max_diff_bytes?: number; // default 200_000
+}
+
+/** Paths no agent may ever touch. Deny always wins over allow. */
+export const DEFAULT_DENY = [
+  ".env",
+  ".env.*",
+  "*.pem",
+  "*.key",
+  "id_rsa*",
+  "*.keystore",
+  ".ssh/**",
+  ".aws/**",
+  ".github/workflows/**",
+];
+
+const GLOB_META = "\\^$.|+()[]{}";
+
+/** `*` stays within a segment, `**` crosses directories (and swallows a following `/`). */
+export function globToRegExp(pattern: string): RegExp {
+  let re = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "*") {
+      if (pattern[i + 1] === "*") {
+        i++; // consume the second '*'
+        if (pattern[i + 1] === "/") i++; // 'a/**/b' also matches 'a/b'
+        re += ".*";
+      } else {
+        re += "[^/]*";
+      }
+    } else if (c === "?") {
+      re += "[^/]";
+    } else if (GLOB_META.includes(c)) {
+      re += "\\" + c;
+    } else {
+      re += c;
+    }
+  }
+  return new RegExp("^" + re + "$");
+}
+
+export function matchGlob(path: string, patterns: string[]): boolean {
+  // gitignore convention: a pattern without '/' matches the basename at any depth
+  // (*.pem catches deploy/server.pem); patterns with '/' stay anchored to the root.
+  const base = path.split("/").pop() ?? path;
+  return patterns.some((p) => {
+    try {
+      const re = globToRegExp(p);
+      return re.test(path) || (!p.includes("/") && re.test(base));
+    } catch {
+      return false;
+    }
+  });
+}
+
+const cleanList = (v: unknown): string[] =>
+  Array.isArray(v)
+    ? v
+        .filter((s): s is string => typeof s === "string")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(0, 50)
+        .map((s) => s.slice(0, 200))
+    : [];
+
+/** Sanitize an API-supplied policy: unknown keys dropped, numbers clamped. */
+export function normalizePolicy(raw: unknown): TaskPolicy {
+  const o = (raw ?? {}) as Record<string, unknown>;
+  const clamp = (v: unknown, min: number, max: number, dflt: number) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.floor(n))) : dflt;
+  };
+  const p: TaskPolicy = {};
+  const allow = cleanList(o.allow);
+  const deny = cleanList(o.deny);
+  if (allow.length) p.allow = allow;
+  if (deny.length) p.deny = deny;
+  if (o.max_files !== undefined) p.max_files = clamp(o.max_files, 1, 10000, 200);
+  if (o.max_diff_bytes !== undefined) p.max_diff_bytes = clamp(o.max_diff_bytes, 1000, 5000000, 200000);
+  return p;
+}
+
+export interface PolicyViolation {
+  rule: string;
+  detail: string;
+}
+
+/**
+ * Deterministic gate #1 — runs BEFORE the LLM review and short-circuits it.
+ * A violation is a scheduling fact, not an opinion: reject with machine instructions.
+ */
+export function applyPolicy(
+  rawPolicy: unknown,
+  touchSet: string[],
+  diffBytes: number,
+): { ok: boolean; violations: PolicyViolation[]; instructions: string } {
+  const p = normalizePolicy(rawPolicy);
+  const deny = [...DEFAULT_DENY, ...(p.deny ?? [])];
+  const violations: PolicyViolation[] = [];
+  for (const f of touchSet) {
+    if (matchGlob(f, deny)) violations.push({ rule: "deny", detail: `文件 ${f} 命中禁改清单` });
+    else if (p.allow && p.allow.length && !matchGlob(f, p.allow))
+      violations.push({ rule: "allow", detail: `文件 ${f} 不在本任务允许范围内` });
+  }
+  const maxFiles = p.max_files ?? 200;
+  if (touchSet.length > maxFiles)
+    violations.push({ rule: "max_files", detail: `改动 ${touchSet.length} 个文件,超过上限 ${maxFiles}` });
+  const maxDiff = p.max_diff_bytes ?? 200000;
+  if (diffBytes > maxDiff)
+    violations.push({ rule: "max_diff_bytes", detail: `diff ${diffBytes} 字节,超过上限 ${maxDiff}` });
+  const instructions = violations.length
+    ? "确定性策略拦截(非 AI 审查),请收窄改动后重做:\n" +
+      violations.map((v) => `- [${v.rule}] ${v.detail}`).join("\n")
+    : "";
+  return { ok: violations.length === 0, violations, instructions };
+}
+
+export interface CheckResult {
+  cmd?: string;
+  exit?: number | null;
+  tail?: string;
+}
+export interface ChecksReport {
+  tests?: CheckResult | null;
+  lint?: CheckResult | null;
+}
+
+/**
+ * Deterministic gate #2 — test/lint results the runner executed against the
+ * fork-BASE scripts. Absent checks (old runner, no package.json) are not judged;
+ * a reported non-zero exit always is. Fail-closed on what ran, tolerant of what didn't.
+ */
+export function evalChecks(checks: unknown): { ok: boolean; failed: string[]; instructions: string } {
+  const c = (checks ?? {}) as ChecksReport;
+  const failed: string[] = [];
+  const parts: string[] = [];
+  for (const key of ["tests", "lint"] as const) {
+    const r = c[key];
+    if (!r || r.exit === undefined || r.exit === null) continue;
+    if (Number(r.exit) !== 0) {
+      failed.push(key);
+      parts.push(`- [${key}] 命令 \`${r.cmd ?? key}\` 退出码 ${r.exit}:\n${String(r.tail ?? "").slice(0, 1500)}`);
+    }
+  }
+  return {
+    ok: failed.length === 0,
+    failed,
+    instructions: failed.length ? "本地确定性检查未通过,请修复后重做:\n" + parts.join("\n") : "",
+  };
+}
+
 export function parseReviewOutput(out: unknown): ReviewVerdict {
   const text = flattenAi(out) || (out == null ? "" : JSON.stringify(out));
   const m = /\{[\s\S]*\}/.exec(text);

@@ -1,5 +1,5 @@
 -- Relay kernel state: D1 for scheduling, Git notes for memory.
--- Kept in sync with migrate2.sql / migrate3.sql (fresh installs run only this file).
+-- Kept in sync with migrate2.sql / migrate3.sql / migrate4.sql (fresh installs run only this file).
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,             -- tsk_xxxxxxxxxx
   spec TEXT NOT NULL,
@@ -9,9 +9,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   fork_base_sha TEXT,
   forked_at TEXT,                  -- workspace birth; temporal overlap rule uses this
   status TEXT NOT NULL DEFAULT 'queued',
-  -- queued -> assigned -> pushed -> (review) awaiting_merge -> merging -> merged
-  --                \-> failed                \-> review_failed -> assigned...
-  --                                            \-> re_forked -> assigned...
+  -- queued -> assigned -> pushed -> (gates) awaiting_merge -> merging -> merged
+  --                \-> failed       gates: policy/checks reject -> review_failed -> assigned...
+  --                                 review approve + flag / review error -> needs_human -> (human) awaiting_merge|review_failed
+  --                                                     re-fork: re_forked -> assigned...
   assigned_agent TEXT,
   attempt INTEGER NOT NULL DEFAULT 0,
   touch_set TEXT,                  -- JSON array of changed file paths
@@ -19,6 +20,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   review TEXT,                     -- JSON: {verdict, reason, instructions, model}
   merged_sha TEXT,
   merged_at TEXT,
+  policy TEXT,                     -- JSON TaskPolicy: allow/deny globs, max_files, max_diff_bytes
+  needs_human_review INTEGER NOT NULL DEFAULT 0,  -- human gate after review approval
+  checks TEXT,                     -- JSON: deterministic check results {tests:{cmd,exit,tail},lint:{...}}
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

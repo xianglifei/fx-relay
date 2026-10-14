@@ -36,6 +36,11 @@ export const dashboardHtml = `<!doctype html>
   .task .meta { font-size: 11.5px; color: var(--dim); display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
   .chip { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; }
   .file { font-family: ui-monospace, monospace; font-size: 11px; background: var(--panel2); border: 1px solid var(--border); border-radius: 5px; padding: 0 6px; }
+  .hg { display: inline-flex; gap: 5px; }
+  .hg button { background: var(--panel2); border: 1px solid var(--border); color: var(--ink); border-radius: 6px; padding: 1px 8px; font-size: 11px; cursor: pointer; }
+  .hg button:hover { border-color: var(--accent); }
+  .hg button:first-child:hover { color: var(--green); }
+  .hg button:last-child:hover { color: var(--red); }
   .sha { font-family: ui-monospace, monospace; color: var(--cyan); }
   .agent { color: var(--ink); font-weight: 600; }
   .verdict-approve { color: var(--green); } .verdict-reject { color: var(--red); }
@@ -65,6 +70,7 @@ const STATUS = {
   assigned:      ['agent working', 'var(--blue)'],
   pushed:        ['pushed',        'var(--amber)'],
   awaiting_merge:['review passed', 'var(--cyan)'],
+  needs_human:   ['needs human ⏸', 'var(--amber)'],
   merging:       ['merging',       'var(--accent)'],
   merged:        ['merged',        'var(--green)'],
   re_forked:     ['re-forked',     'var(--orange)'],
@@ -74,6 +80,7 @@ const STATUS = {
 const evColor = k => k.includes('approved')||k.includes('merged') ? 'var(--green)'
   : k.includes('rejected')||k.includes('failed')||k.includes('error') ? 'var(--red)'
   : k.includes('reforked')||k.includes('conflict') ? 'var(--orange)'
+  : k.includes('held') ? 'var(--amber)'
   : k.includes('granted') ? 'var(--accent)' : 'var(--cyan)';
 
 let TOKEN = localStorage.getItem('relay_token') || '';
@@ -113,10 +120,12 @@ function taskCard(t) {
   const [label, color] = STATUS[t.status] || [t.status, 'var(--dim)'];
   const files = (t.touch_set ? JSON.parse(t.touch_set) : []).map(f => '<span class="file">' + esc(f) + '</span>').join(' ');
   const review = t.review ? JSON.parse(t.review) : null;
-  const rv = review ? '<span class="' + (review.verdict === 'approve' ? 'verdict-approve' : 'verdict-reject') + '">⚖ ' + esc(review.verdict) + (review.reason ? ' · ' + esc(review.reason) : '') + '</span>' : '';
+  const rv = review ? '<span class="' + (review.verdict === 'approve' ? 'verdict-approve' : 'verdict-reject') + '">⚖ ' + esc(review.model === 'human' ? 'human' : review.verdict) + (review.reason ? ' · ' + esc(review.reason) : '') + '</span>' : '';
+  const gate = t.status === 'needs_human'
+    ? '<span class="hg"><button onclick="humanReview(\\'' + t.id + '\\',true)">✓ 放行</button><button onclick="humanReview(\\'' + t.id + '\\',false)">✗ 打回</button></span>' : '';
   return \`<div class="task">
     <div class="row1"><span class="chip" style="background:\${color}22;color:\${color}">\${label}</span>
-      <span class="id">\${t.id}</span>\${t.attempt > 0 ? '<span class="id">attempt ' + t.attempt + '</span>' : ''}</div>
+      <span class="id">\${t.id}</span>\${t.attempt > 0 ? '<span class="id">attempt ' + t.attempt + '</span>' : ''}\${gate}</div>
     <div class="spec">\${esc(t.spec.length > 110 ? t.spec.slice(0, 110) + '…' : t.spec)}</div>
     <div class="meta">
       \${t.assigned_agent ? '<span class="agent">🤖 ' + esc(t.assigned_agent) + '</span>' : ''}
@@ -127,6 +136,17 @@ function taskCard(t) {
       <span>\${fmt(t.updated_at)}</span>
     </div>
   </div>\`;
+}
+
+async function humanReview(id, approve) {
+  const note = approve ? '' : (prompt('打回原因(将成为下一轮整改指令):') || '人工打回,请对照任务规格重做');
+  const r = await fetch('/tasks/' + id + '/human_review', {
+    method: 'POST',
+    headers: { authorization: 'Bearer ' + TOKEN, 'content-type': 'application/json' },
+    body: JSON.stringify({ decision: approve ? 'approve' : 'reject', note }),
+  });
+  if (!r.ok) alert('人审失败(' + r.status + ') — 需要 admin 令牌');
+  refresh();
 }
 
 function renderEvents(evs) {

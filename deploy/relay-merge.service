@@ -1,0 +1,32 @@
+# Resident merge executor (systemd, for a VPS that can reach the kernel).
+# Install:
+#   sudo useradd -r -s /usr/sbin/nologin relay || true
+#   sudo rsync -a --delete runner/ /opt/relay-runner/
+#   sudo cp deploy/relay-merge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now relay-merge
+# The merge loop self-drives /schedule — this one service is a complete unattended merge path.
+# NOTE: *.workers.dev is unreachable from most mainland-China networks; use an
+# overseas VPS, a custom domain on the worker, or set proxy env vars below.
+[Unit]
+Description=Relay merge executor (schedule + ff/cherry-pick onto mainline)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+WorkingDirectory=/opt/relay-runner
+Environment=NODE_USE_ENV_PROXY=1
+# Environment=HTTPS_PROXY=http://127.0.0.1:7897
+# Environment=https_proxy=http://127.0.0.1:7897
+ExecStart=/usr/bin/node /opt/relay-runner/bin/relay-runner.mjs merge
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target

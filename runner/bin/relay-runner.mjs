@@ -5,8 +5,9 @@
  * Commands:
  *   relay-runner task   "spec..." [--file SPEC.md] [--baseline NAME] [--needs-human]
  *                      [--allow g1,g2] [--deny g1] [--max-files N]   # submit a task (submit token ok)
- *   relay-runner attach --dir /path/to/repo --repo NAME              # onboard an existing git repo
- *   relay-runner seed  --dir ../baseline-template [--repo demo-app]  # seed a template dir
+ *   relay-runner attach --dir /path/to/repo --repo NAME [--force]    # onboard an existing git repo
+ *   relay-runner sync  --repo NAME [--dir /path/to/repo] [--push]    # pull merged mainline back (ff-only)
+ *   relay-runner seed  --dir ../baseline-template [--repo demo-app] [--force]
  *   relay-runner work  --agent zcode|claude|codebuddy [--once]       # claim + drive a coding agent
  *   relay-runner merge [--once]          # schedule + merge-grant executor (ff / cherry-pick onto mainline)
  *   relay-runner config <url> <token>
@@ -16,10 +17,12 @@
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile, readFile, chmod } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { adapters } from "../adapters.mjs";
+import { summarizeAgentOutput, conventionFilesIn } from "../lib/agent-output.mjs";
 
 const ROOT = path.dirname(new URL(import.meta.url).pathname);
 const LOCAL_CFG = path.join(ROOT, "..", "relay.local.json");
@@ -80,7 +83,11 @@ const git = (cwd, ...args) => sh("git", ["-C", cwd, ...args]);
 const gitAuth = (cwd, token, ...args) =>
   sh("git", ["-C", cwd, "-c", `http.extraHeader=Authorization: Bearer ${token}`, ...args]);
 
-function buildPrompt(task) {
+function buildPrompt(task, repo) {
+  const conventions = repo ? conventionFilesIn(repo) : [];
+  const conventionRule = conventions.length
+    ? `1. 阅读仓库根目录的 ${conventions.join("、")} 并遵守其中的项目约定;`
+    : "1. 仓库没有约定文件,请遵循现有代码风格,保持改动最小;";
   const sections = [
     "你是被 Relay 平台派来的编码 agent,在一个独立工作区里完成一项编码任务。",
     "",
@@ -108,11 +115,12 @@ function buildPrompt(task) {
   sections.push(
     "",
     "## 规则",
-    "1. 阅读仓库根目录的 AGENTS.md 并遵守其中的项目约定;",
+    conventionRule,
     "2. 只修改与任务相关的文件,保持改动最小;",
     "3. 完成后用 git 提交所有改动,提交信息格式:`task: <一句话摘要>`;",
     "4. 不要执行 git push(push 由 runner 负责),不要改动 git 配置或远程地址;",
-    "5. 如果任务无法完成,在仓库根目录写一个 RELAY_FAILURE.md 说明原因。",
+    "5. 如果任务无法完成,在仓库根目录写一个 RELAY_FAILURE.md 说明原因;",
+    "6. 最后在 stdout 输出一段简短执行摘要(做了什么、关键决策与原因),它会随溯源记录持久化。",
   );
   return sections.filter((s) => s !== "").join("\n");
 }
@@ -217,7 +225,7 @@ async function executeTask(task, fromStatus, agent) {
     const baseSha = (await git(repo, "rev-parse", "HEAD")).out.trim() || task.fork_base_sha;
     if (!baseSha) throw new Error("cannot determine fork base sha");
 
-    await runAgent(agent, buildPrompt(task), repo);
+    const agentRun = await runAgent(agent, buildPrompt(task, repo), repo);
 
     await git(repo, "add", "-A");
     const st = await git(repo, "status", "--porcelain");
@@ -238,7 +246,8 @@ async function executeTask(task, fromStatus, agent) {
       return true;
     }
 
-    // Provenance as git notes: the repo IS the memory.
+    // Provenance as git notes: the repo IS the memory — including the agent's
+    // own execution summary (what it did and why), readable by any successor.
     const provenance = {
       task_id: task.id,
       agent,
@@ -247,7 +256,8 @@ async function executeTask(task, fromStatus, agent) {
       fork_base: baseSha,
       attempt: task.attempt,
       remediation: task.review?.instructions ? true : false,
-      runner: "relay-runner/0.2",
+      summary: summarizeAgentOutput(agentRun.out),
+      runner: "relay-runner/0.3",
       pushed_at: new Date().toISOString(),
     };
     await git(repo, "notes", "add", "-f", "-m", JSON.stringify(provenance), headSha);
@@ -468,6 +478,87 @@ async function submitTask(flags, pos) {
   return task;
 }
 
+/**
+ * Pull the merged mainline back into a local clone of an attached repo.
+ * Fast-forward only: if the local branch diverged, the user decides (re-attach
+ * or merge by hand) — sync never rewrites local history silently.
+ */
+async function syncBaseline(repoName, dir, push) {
+  if (!repoName) throw new Error("usage: relay-runner sync --repo NAME [--dir /path/to/repo] [--push]");
+  const abs = path.resolve(process.cwd(), dir || ".");
+  if (!existsSync(path.join(abs, ".git"))) throw new Error(`${abs} 不是 git 仓库`);
+  const branch = (await git(abs, "symbolic-ref", "--short", "HEAD")).out.trim();
+  if (!branch) throw new Error("本地仓库处于 detached HEAD,无法 sync");
+
+  const boot = await api("/bootstrap", { method: "POST", body: JSON.stringify({ repo: repoName }) });
+  const fetch = await gitAuth(abs, boot.token, "fetch", boot.remote, "main");
+  if (fetch.code !== 0) throw new Error(`fetch 失败: ${fetch.out.slice(0, 300)}`);
+  const merge = await git(abs, "merge", "--ff-only", "FETCH_HEAD");
+  if (merge.code !== 0) {
+    throw new Error(
+      `本地 ${branch} 与 Relay 主线分叉,无法快进(本地是否有未经过 Relay 的提交?)。\n${merge.out.slice(0, 300)}`,
+    );
+  }
+  const head = (await git(abs, "rev-parse", "--short", "HEAD")).out.trim();
+  const up = merge.out.includes("Already up to date") ? "已是最新" : `已快进`;
+  console.log(`[sync] ${repoName} → ${abs}@${branch} (${up}, HEAD ${head})`);
+  if (push) {
+    const p = await git(abs, "push", "origin", `HEAD:${branch}`);
+    if (p.code !== 0) throw new Error(`push origin 失败: ${p.out.slice(0, 300)}`);
+    console.log(`[sync] 已推送 origin/${branch}`);
+  }
+}
+
+// ---- network bootstrap: direct first, then probe common local proxies ----
+
+const PROXY_CANDIDATES = [7897, 7890, 7891, 1087, 8118];
+
+function portAccepts(port) {
+  return new Promise((resolve) => {
+    const s = net.connect({ host: "127.0.0.1", port, timeout: 400 });
+    s.on("connect", () => { s.destroy(); resolve(true); });
+    s.on("error", () => resolve(false));
+    s.on("timeout", () => { s.destroy(); resolve(false); });
+  });
+}
+
+/**
+ * workers.dev is unreachable on many networks. Rather than forcing everyone to
+ * remember the proxy env trio, probe: if direct fails and a local proxy port
+ * answers, re-exec ourselves with proxy env + NODE_USE_ENV_PROXY set.
+ */
+async function ensureNetwork() {
+  if (process.env.RELAY_PROXY_RESOLVED === "1") return;
+  if (process.env.HTTPS_PROXY || process.env.https_proxy || process.env.NODE_USE_ENV_PROXY) return;
+  if (process.env.RELAY_NO_PROXY === "1") return;
+  const { url } = await cfg();
+  if (!url) return;
+  const direct = await fetch(url.replace(/\/$/, "") + "/healthz", {
+    signal: AbortSignal.timeout(4000),
+  }).then((r) => r.ok).catch(() => false);
+  if (direct) return;
+  for (const port of PROXY_CANDIDATES) {
+    if (!(await portAccepts(port))) continue;
+    const proxy = `http://127.0.0.1:${port}`;
+    console.error(`[net] kernel 直连失败,检测到本地代理 ${proxy},自动走代理(禁用:RELAY_NO_PROXY=1)`);
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      env: {
+        ...process.env,
+        NODE_USE_ENV_PROXY: "1",
+        HTTPS_PROXY: proxy,
+        https_proxy: proxy,
+        HTTP_PROXY: proxy,
+        http_proxy: proxy,
+        RELAY_PROXY_RESOLVED: "1",
+      },
+      stdio: "inherit",
+    });
+    child.on("close", (c) => process.exit(c ?? 0));
+    return new Promise(() => {}); // parent parks; child owns stdio
+  }
+  console.error("[net] kernel 直连失败且未发现本地代理(7897/7890/7891/1087/8118);如需代理请设置 HTTPS_PROXY");
+}
+
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const flags = {};
@@ -481,6 +572,8 @@ async function main() {
       else flags[a.slice(2)] = true;
     } else pos.push(a);
   }
+
+  if (cmd !== "config" && cmd !== undefined) await ensureNetwork();
 
   if (cmd === "config") {
     const [url, token] = pos;
@@ -496,6 +589,10 @@ async function main() {
   }
   if (cmd === "attach") {
     await attachExisting(flags.dir || ".", flags.repo, !!flags.force);
+    return;
+  }
+  if (cmd === "sync") {
+    await syncBaseline(flags.repo, flags.dir, !!flags.push);
     return;
   }
   if (cmd === "task") {
@@ -541,10 +638,11 @@ async function main() {
       if (!did) await new Promise((r) => setTimeout(r, 5000));
     }
   }
-  console.error("usage: relay-runner <task|attach|seed|work|merge|config> [args]");
+  console.error("usage: relay-runner <task|attach|sync|seed|work|merge|config> [args]");
   console.error("  task   \"spec...\" [--file SPEC.md] [--baseline NAME] [--needs-human] [--allow g,...] [--deny g,...] [--max-files N]");
-  console.error("  attach --dir /path/to/repo --repo NAME");
-  console.error("  seed   --dir ../baseline-template [--repo demo-app]");
+  console.error("  attach --dir /path/to/repo --repo NAME [--force]");
+  console.error("  sync   --repo NAME [--dir /path/to/repo] [--push]     # merged mainline → local (ff-only)");
+  console.error("  seed   --dir ../baseline-template [--repo demo-app] [--force]");
   console.error("  work   --agent claude|codebuddy|zcode [--once]");
   console.error("  merge  [--once]");
   console.error("  config <url> <token>");

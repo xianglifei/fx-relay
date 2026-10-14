@@ -3,6 +3,10 @@
 **A Git collaboration kernel for AI agents.**
 **给 AI agent 用的 Git 协作内核。**
 
+[English](README.en.md) · 演示视频:[docs/relay-demo.mp4](docs/relay-demo.mp4)
+
+![Relay 看板:任务板 / 活动流 / 溯源](docs/dashboard.png)
+
 Relay runs on Cloudflare Workers + [Artifacts](https://developers.cloudflare.com/artifacts/) and reimplements how changes are made to a codebase when the primary committers are AI agents — not humans.
 
 > 传统 GitHub 的原语是"仓库 + 分支 + PR",围绕人类的注意力与信任设计。
@@ -52,20 +56,21 @@ fx-relay/
 │   ├── src/index.ts   任务 API · fork · 四道闸门 · 合并调度器 · 队列消费者
 │   ├── src/logic.ts   纯逻辑:调度决策 · glob 策略 · 检查评估(单测覆盖)
 │   ├── src/dashboard.ts  内置看板(任务板 / 活动流 / 溯源 / 人审按钮)
-│   └── schema.sql     D1 表结构(调度状态;migrate2-4 为增量)
-├── runner/            执行面 CLI
-│   ├── bin/relay-runner.mjs   task | attach | seed | work | merge | config
-│   └── adapters.mjs   agent 适配器(插件式)
+│   └── schema.sql     D1 表结构(调度状态;migrate2-5 为增量)
+├── runner/            执行面 CLI(零依赖)
+│   ├── bin/relay-runner.mjs   task | attach | sync | seed | work | merge | config
+│   ├── adapters.mjs   agent 适配器(插件式)
+│   └── lib/           可单测的纯 helper(执行摘要、约定文件探测)
 ├── deploy/            常驻工件:launchd plist(macOS) + systemd unit(Linux)
 ├── baseline-template/ 演示基线应用(中文 Todo,纯静态)
+├── AGENTS.md          给来访 coding agent 的操作手册
 ├── DOGFOOD.md         日常使用日志(真实仓库两周试用,发现即记)
-└── docs/              设计笔记
+└── docs/              设计笔记 · 演示视频
 ```
 
 ## Quickstart
 
 前置:Node 20+(常驻建议 24+),一个开了 Artifacts 的 Cloudflare 账号(Workers Paid),wrangler 4.149+。
-国内网络注意:`*.workers.dev` 通常不可直连,给 runner 配代理(`NODE_USE_ENV_PROXY=1` + `https_proxy=http://127.0.0.1:7897`)。
 
 ```bash
 # 1. 部署控制面
@@ -92,8 +97,14 @@ node bin/relay-runner.mjs task "给应用加一个深色模式切换按钮" \
 node bin/relay-runner.mjs work --agent claude --once
 node bin/relay-runner.mjs merge --once     # merge 循环自带 /schedule,常驻即无人值守
 
+# 6. 取回成果:主线合并后快进同步回你的本地仓库(--push 顺带推 GitHub)
+node bin/relay-runner.mjs sync --repo your-repo --dir /path/to/your-repo [--push]
+
 # 看板:https://<your>.workers.dev/  (admin 令牌进看板,needs_human 任务可一键放行/打回)
 ```
+
+> 国内网络:runner 会在直连失败时自动探测本地代理(7897/7890/7891/1087/8118);
+> 手动指定则设 `NODE_USE_ENV_PROXY=1` + `https_proxy`,禁用自动探测用 `RELAY_NO_PROXY=1`。
 
 ## 信任模型:三道闸门 + 一道人闸
 
@@ -168,9 +179,11 @@ T9/T10 验证确定性与人审路径不经 AI(策略闸门)或挂起后人可�
 ## 路线图
 
 - [x] 确定性信任层:任务级策略(allow/deny/max_files)+ 本地 test/lint 闸门 + fail-closed + 人审闸门
-- [x] 令牌分级(submit/admin)+ 一行式任务提交 + attach 已有仓库
+- [x] 令牌分级(submit/admin,含原子限流)+ 一行式任务提交 + attach 已有仓库
 - [x] 常驻 merge(自调度,launchd/systemd 工件)
-- [ ] AGENTS.md 项目约定进审查 prompt(策略已可任务级配置,约定级待做)
+- [x] 日常闭环:sync 回本地/GitHub、约定文件自动探测、agent 执行摘要进溯源、本地代理自动探测
+- [x] 新人文档:AGENTS.md(给来访 agent)+ 演示视频/截图入口
+- [ ] 目标仓库的约定文件进审查 prompt(工作侧已探测,审查侧待做)
 - [ ] 事件订阅替代轮询(Artifacts push 事件 → Queues 已接,语义闭环待打磨)
 - [ ] worker 自定义域(境内服务器常驻 merge 的前置)
 - [ ] 预览部署(每任务一个 Workers 预览环境)

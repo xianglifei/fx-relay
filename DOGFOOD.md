@@ -24,11 +24,12 @@
 
 ### 别扭清单(发现即记,决策时用)
 
-1. **回程 UX 未定义**:主线合并后怎么回到本地/GitHub 是手动的(bootstrap 拿 token → fetch → ff)。
-   应做成 `relay-runner sync --repo fx-armory`(甚至监听 merged 事件自动推 GitHub)。
-2. **约定文件名假设**:runner prompt 写死"阅读 AGENTS.md",fx-armory 实际是 CLAUDE.md
-   (claude 自己变通了)。prompt 应探测存在的约定文件(AGENTS.md / CLAUDE.md / .cursorrules)。
-3. **网络姿势**:workers.dev 被墙,runner 要带 `NODE_USE_ENV_PROXY=1` + 代理变量三件套,
-   每次手敲容易忘(已写进 README;后续考虑 runner 自动探测本地代理)。
-4. **审查上下文**:claude 的执行说明很有信息量(为什么放文件末尾、-type f 的理由),
-   但这些只打在 runner 日志里,看板/溯源看不到——执行摘要或许值得进 git notes。
+1. ~~**回程 UX 未定义**~~ → ✅ 已修:`relay-runner sync --repo X --dir <本地> [--push]`,ff-only,E2E 验证(2026-10-14)。
+2. ~~**约定文件名假设**~~ → ✅ 已修:prompt 自动探测 AGENTS.md/CLAUDE.md/GEMINI.md/.cursorrules,没有则退化为「遵循现有风格」。
+3. ~~**网络姿势**~~ → ✅ 已修:runner 直连失败时自动探测本地代理(7897/7890/7891/1087/8118)并 re-exec;`RELAY_NO_PROXY=1` 禁用。
+4. ~~**审查上下文**~~ → ✅ 已修:任务 prompt 要求 agent 在 stdout 收尾输出执行摘要,runner 取尾部 1200 字进 git notes(溯源)并在看板展示。
+
+### 2026-10-14 晚 — P0/P1 收尾
+
+- sync/约定探测/摘要进溯源/自动代理 全部上线并 E2E 验证;AGENTS.md、README 双语 + 演示视频 + 看板截图就位。
+- 顺手清了 59 条测试残留任务与其工作区仓库(失败套件轮次的遗留),看板恢复干净。

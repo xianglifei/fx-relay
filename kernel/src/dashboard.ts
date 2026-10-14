@@ -163,6 +163,7 @@ function renderProvenance(rows) {
       <div class="row1"><span class="id">\${r.repo}</span><span class="sha">\${short(r.commit_sha)}</span></div>
       <div class="meta"><span class="agent">🤖 \${esc(note.agent || r.agent || '?')}</span><span>\${esc(note.model || r.model || '')}</span><span>task \${esc(r.task_id || '')}</span><span>\${fmt(r.created_at)}</span></div>
       \${note.spec_digest ? '<div class="spec" style="color:var(--dim);font-size:12px">“' + esc(note.spec_digest.slice(0, 90)) + '…”</div>' : ''}
+      \${note.summary ? '<div class="spec" style="font-size:12px;border-left:2px solid var(--border);padding-left:8px;margin-top:4px;color:var(--dim);white-space:pre-wrap">' + esc(note.summary.slice(0, 220)) + '</div>' : ''}
     </div>\`;
   }).join('');
 }
